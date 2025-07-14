@@ -65,7 +65,7 @@ class CampaignController {
                 followUpCount: campaign.follow_up_count,
                 originalEmail: campaign.original_email,
                 emailPreview: campaign.email_preview,
-                senderInfo: campaign.sender_info,
+                senderInfo: campaign.sender_info, // Already parsed in repository
                 errorMessage: campaign.error_message
             };
 
@@ -109,12 +109,14 @@ class CampaignController {
                 });
             }
 
+            console.log(`📧 Generating follow-up email for campaign ${campaign.id}`);
+
             // Generate follow-up email
             const followUpEmail = await emailService.generateFollowUpEmail(
                 campaign.original_email,
                 campaign.company_name,
                 campaign.job_title,
-                campaign.sender_info,
+                campaign.sender_info, // Already parsed object
                 campaign.follow_up_count + 1
             );
 
@@ -127,14 +129,30 @@ class CampaignController {
             const bodyStart = followUpEmail.indexOf('\n\n') + 2;
             const body = followUpEmail.substring(bodyStart).trim();
 
+            // Get user's email credentials for sending follow-up
+            const { userRepository } = await import('../repositories/userRepository.js');
+            const userWithCredentials = await userRepository.findByIdWithEmailCredentials(req.user.user_id);
+            const userEmailCredentials = userWithCredentials && userWithCredentials.has_email_credentials ? {
+                email: userWithCredentials.email,
+                appPassword: userWithCredentials.email_password
+            } : null;
+
             // Send follow-up email (without attachment for follow-ups)
             const emailResult = await emailService.sendEmail(
                 campaign.recipient_email, 
                 subject, 
                 body, 
-                campaign.sender_info, 
-                null // No attachment for follow-ups
+                campaign.sender_info, // Already parsed object
+                null, // No attachment for follow-ups
+                req.user.user_id,
+                userEmailCredentials
             );
+
+            console.log(`📧 Follow-up email result:`, {
+                success: emailResult.success,
+                method: emailResult.method,
+                error: emailResult.error
+            });
 
             if (emailResult.success) {
                 // Update campaign with follow-up info
@@ -145,8 +163,9 @@ class CampaignController {
                 
                 res.json({
                     success: true,
-                    message: 'Follow-up email sent successfully',
-                    followUpCount: campaign.follow_up_count + 1
+                    message: `Follow-up email sent successfully via ${emailResult.method}`,
+                    followUpCount: campaign.follow_up_count + 1,
+                    method: emailResult.method
                 });
             } else {
                 res.status(500).json({ 
@@ -212,6 +231,8 @@ class CampaignController {
                 });
             }
 
+            console.log(`🔄 Retrying failed campaign ${campaign.id}`);
+
             // Reset campaign status to pending for retry
             await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                 status: 'pending',
@@ -227,6 +248,63 @@ class CampaignController {
         } catch (error) {
             console.error('Error retrying campaign:', error);
             res.status(500).json({ error: 'Failed to retry campaign' });
+        }
+    }
+
+    // 🔥 NEW: Delete campaign
+    async deleteCampaign(req, res) {
+        try {
+            const { id } = req.params;
+            const deletedCampaign = await campaignRepository.deleteCampaign(id, req.user.user_id);
+            
+            if (!deletedCampaign) {
+                return res.status(404).json({ error: 'Campaign not found' });
+            }
+
+            // Delete resume file if it exists
+            if (deletedCampaign.resume_path) {
+                try {
+                    const fs = await import('fs');
+                    if (fs.default.existsSync(deletedCampaign.resume_path)) {
+                        fs.default.unlinkSync(deletedCampaign.resume_path);
+                        console.log(`🗑️ Deleted resume file: ${deletedCampaign.resume_path}`);
+                    }
+                } catch (fileError) {
+                    console.error('Error deleting resume file:', fileError);
+                }
+            }
+
+            console.log(`🗑️ Campaign ${id} deleted successfully`);
+
+            res.json({
+                success: true,
+                message: 'Campaign deleted successfully'
+            });
+        } catch (error) {
+            console.error('Error deleting campaign:', error);
+            res.status(500).json({ error: 'Failed to delete campaign' });
+        }
+    }
+
+    // 🔥 NEW: Search campaigns
+    async searchCampaigns(req, res) {
+        try {
+            const { q: searchTerm, status, dateFrom, dateTo } = req.query;
+            const filters = { status, dateFrom, dateTo };
+            
+            const campaigns = await campaignRepository.searchCampaigns(
+                req.user.user_id, 
+                searchTerm, 
+                filters
+            );
+            
+            res.json({
+                success: true,
+                campaigns
+            });
+        } catch (error) {
+            console.error('Error searching campaigns:', error);
+            res.status(500).json({ error: 'Failed to search campaigns' });
         }
     }
 }

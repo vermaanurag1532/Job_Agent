@@ -8,10 +8,10 @@ const router = express.Router();
 // Apply rate limiting to auth routes
 router.use(rateLimit(15 * 60 * 1000, 50)); // 50 requests per 15 minutes
 
-// Google OAuth Routes
+// Simple Google OAuth Routes (just for basic profile)
 router.get('/google', 
     passport.authenticate('google', { 
-        scope: ['profile', 'email'] 
+        scope: ['profile', 'email']
     })
 );
 
@@ -27,8 +27,6 @@ router.get('/google/callback',
                 throw new Error('No user data received from Google');
             }
 
-            // req.user is already the database user object from Passport strategy
-            // We just need to generate a token and create the response
             const token = authService.generateToken(req.user);
             
             console.log('✅ Token generated for user:', {
@@ -37,16 +35,16 @@ router.get('/google/callback',
                 tokenGenerated: !!token
             });
             
-            // Set token in HTTP-only cookie (more secure)
+            // Set token in HTTP-only cookie
             res.cookie('auth_token', token, {
                 httpOnly: true,
                 secure: process.env.NODE_ENV === 'production',
                 sameSite: 'lax',
                 maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-                domain: 'localhost' // Allow cookies across localhost ports
+                domain: 'localhost'
             });
 
-            // Redirect to frontend dashboard with success
+            // Redirect to frontend
             const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/?auth=success`;
             console.log('🔄 Redirecting to:', redirectUrl);
             res.redirect(redirectUrl);
@@ -58,10 +56,100 @@ router.get('/google/callback',
     }
 );
 
+// Store user's email credentials
+router.post('/email-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { emailPassword } = req.body;
+        
+        if (!emailPassword) {
+            return res.status(400).json({ error: 'Email app password is required' });
+        }
+
+        const { userRepository } = await import('../repositories/userRepository.js');
+        await userRepository.updateEmailCredentials(req.user.user_id, emailPassword);
+        
+        res.json({ 
+            success: true,
+            message: 'Email credentials saved successfully',
+            hasEmailCredentials: true
+        });
+    } catch (error) {
+        console.error('Store email credentials error:', error);
+        res.status(500).json({ error: 'Failed to store email credentials' });
+    }
+});
+
+// Remove user's email credentials
+router.delete('/email-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { userRepository } = await import('../repositories/userRepository.js');
+        await userRepository.removeEmailCredentials(req.user.user_id);
+        
+        res.json({ 
+            success: true,
+            message: 'Email credentials removed successfully',
+            hasEmailCredentials: false
+        });
+    } catch (error) {
+        console.error('Remove email credentials error:', error);
+        res.status(500).json({ error: 'Failed to remove email credentials' });
+    }
+});
+
+// Test user's email credentials
+router.post('/test-email-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { emailPassword } = req.body;
+        
+        if (!emailPassword) {
+            return res.status(400).json({ error: 'Email app password is required' });
+        }
+
+        console.log(`🧪 Testing email credentials for user: ${req.user.email}`);
+        
+        // Import email service dynamically
+        const { emailService } = await import('../services/emailService.js');
+        
+        // Create a test transporter
+        const testTransporter = emailService.createUserEmailTransporter(req.user.email, emailPassword);
+        
+        // Test the connection
+        await testTransporter.verify();
+        
+        console.log(`✅ Email credentials test successful for: ${req.user.email}`);
+        
+        res.json({ 
+            success: true,
+            message: 'Email credentials are valid',
+            email: req.user.email
+        });
+    } catch (error) {
+        console.error('❌ Test email credentials error:', error);
+        
+        if (error.code === 'EAUTH') {
+            return res.status(400).json({ 
+                error: 'Invalid email credentials. Please check your app password.',
+                code: 'INVALID_CREDENTIALS'
+            });
+        }
+        
+        if (error.message && error.message.includes('Username and Password not accepted')) {
+            return res.status(400).json({ 
+                error: 'Gmail app password is incorrect. Please generate a new one.',
+                code: 'INVALID_CREDENTIALS'
+            });
+        }
+        
+        res.status(500).json({ 
+            error: 'Failed to test email credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
 // Get current user info
 router.get('/me', authenticateToken, async (req, res) => {
     try {
-        // req.user already contains the user info from authenticateToken middleware
         const userInfo = {
             user: {
                 id: req.user.user_id,
@@ -69,7 +157,8 @@ router.get('/me', authenticateToken, async (req, res) => {
                 fullName: req.user.full_name,
                 profilePicture: req.user.profile_picture,
                 createdAt: req.user.created_at,
-                lastLogin: req.user.last_login
+                lastLogin: req.user.last_login,
+                hasEmailCredentials: req.user.has_email_credentials
             },
             stats: await authService.getUserStats(req.user.user_id)
         };
@@ -78,6 +167,23 @@ router.get('/me', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Get current user error:', error);
         res.status(500).json({ error: 'Failed to get user information' });
+    }
+});
+
+// Get email credentials status
+router.get('/email-status', authenticateToken, async (req, res) => {
+    try {
+        const { userRepository } = await import('../repositories/userRepository.js');
+        const user = await userRepository.findById(req.user.user_id);
+        
+        res.json({
+            hasEmailCredentials: user.has_email_credentials,
+            email: user.email,
+            canSendEmails: user.has_email_credentials
+        });
+    } catch (error) {
+        console.error('Email status check error:', error);
+        res.status(500).json({ error: 'Failed to check email status' });
     }
 });
 
@@ -137,45 +243,33 @@ router.post('/refresh', async (req, res) => {
 });
 
 // Check authentication status
-// Fixed /auth/status endpoint - Replace this in your backend auth routes
-
-// Check authentication status
 router.get('/status', async (req, res) => {
     try {
-        console.log('🔍 Auth status check - cookies:', req.cookies);
-        console.log('🔍 Auth status check - headers:', req.headers.authorization);
-        
         const token = req.cookies.auth_token || req.headers.authorization?.split(' ')[1];
         
         if (!token) {
-            console.log('❌ No token found');
             return res.json({ authenticated: false });
         }
 
-        console.log('🔍 Token found, verifying...');
         const decoded = authService.verifyToken(token);
-        console.log('🔍 Token decoded:', { userId: decoded.userId });
         
         const { userRepository } = await import('../repositories/userRepository.js');
         const user = await userRepository.findById(decoded.userId);
         
         if (!user) {
-            console.log('❌ User not found in database');
             return res.json({ authenticated: false });
         }
         
-        console.log('✅ User authenticated:', { userId: user.user_id, email: user.email });
-        
-        // 🎯 FIXED: Return the same format as your frontend expects
         res.json({ 
             authenticated: true,
             user: {
                 id: user.user_id,
                 email: user.email,
-                name: user.full_name,  // 🔥 Changed from fullName to name for frontend compatibility
-                picture: user.profile_picture,  // 🔥 Changed from profilePicture to picture for frontend compatibility
+                name: user.full_name,
+                picture: user.profile_picture,
                 createdAt: user.created_at,
-                lastLogin: user.last_login
+                lastLogin: user.last_login,
+                hasEmailCredentials: user.has_email_credentials
             }
         });
     } catch (error) {

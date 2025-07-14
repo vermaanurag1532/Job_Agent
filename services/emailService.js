@@ -11,7 +11,6 @@ dotenv.config();
 
 // Debug: Check if API key is loaded
 console.log('Gemini API Key loaded:', process.env.GEMINI_API_KEY ? 'Yes' : 'No');
-console.log('Email User loaded:', process.env.EMAIL_USER ? 'Yes' : 'No');
 
 // Initialize Google Generative AI with error handling
 let genAI;
@@ -26,8 +25,23 @@ try {
 }
 
 class EmailService {
-    // Email transporter configuration
-    createEmailTransporter() {
+    // Create email transporter for user's Gmail
+    createUserEmailTransporter(userEmail, userAppPassword) {
+        console.log(`🔧 Creating Gmail transporter for: ${userEmail}`);
+        return nodemailer.createTransport({
+            service: 'gmail',
+            auth: {
+                user: userEmail,
+                pass: userAppPassword
+            },
+            tls: {
+                rejectUnauthorized: false
+            }
+        });
+    }
+
+    // Create fallback email transporter (your email)
+    createFallbackEmailTransporter() {
         return nodemailer.createTransport({
             service: 'gmail',
             auth: {
@@ -187,39 +201,6 @@ If any information is not found, use empty string or empty array for that field.
                 }
             }
 
-            // Search for recent news about the company
-            try {
-                if (process.env.GOOGLE_SEARCH_API_KEY && process.env.GOOGLE_SEARCH_ENGINE_ID) {
-                    const newsQuery = `${companyName} company news recent`;
-                    const newsResponse = await axios.get(`https://www.googleapis.com/customsearch/v1?key=${process.env.GOOGLE_SEARCH_API_KEY}&cx=${process.env.GOOGLE_SEARCH_ENGINE_ID}&q=${encodeURIComponent(newsQuery)}&num=3`);
-                    
-                    if (newsResponse.data.items) {
-                        companyInfo.recentNews = newsResponse.data.items.map(item => ({
-                            title: item.title,
-                            snippet: item.snippet,
-                            link: item.link
-                        }));
-                    }
-                }
-            } catch (error) {
-                console.log('Error fetching company news:', error.message);
-            }
-
-            // Search for company information on LinkedIn
-            try {
-                if (process.env.GOOGLE_SEARCH_API_KEY && process.env.GOOGLE_SEARCH_ENGINE_ID) {
-                    const linkedInQuery = `${companyName} site:linkedin.com/company`;
-                    const linkedInResponse = await axios.get(`https://www.googleapis.com/customsearch/v1?key=${process.env.GOOGLE_SEARCH_API_KEY}&cx=${process.env.GOOGLE_SEARCH_ENGINE_ID}&q=${encodeURIComponent(linkedInQuery)}&num=1`);
-                    
-                    if (linkedInResponse.data.items && linkedInResponse.data.items[0]) {
-                        const linkedInInfo = linkedInResponse.data.items[0];
-                        companyInfo.industry = linkedInInfo.snippet;
-                    }
-                }
-            } catch (error) {
-                console.log('Error fetching LinkedIn info:', error.message);
-            }
-
             return companyInfo;
 
         } catch (error) {
@@ -243,7 +224,7 @@ If any information is not found, use empty string or empty array for that field.
         }
     }
 
-    // Extract text from PDF resume - FIXED VERSION
+    // Extract text from PDF resume
     async extractResumeText(filePath) {
         try {
             console.log(`Attempting to extract text from: ${filePath}`);
@@ -341,17 +322,34 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
         }
     }
 
-    // Send email function with resume attachment
-    async sendEmail(recipientEmail, subject, body, senderInfo, resumePath) {
+    // Send email function with user's credentials
+    async sendEmail(recipientEmail, subject, body, senderInfo, resumePath, userId, userEmailCredentials = null) {
         try {
-            const transporter = this.createEmailTransporter();
-            
+            let transporter;
+            let fromEmail;
+            let method;
+
+            // Try to use user's email credentials if provided
+            if (userEmailCredentials && userEmailCredentials.email && userEmailCredentials.appPassword) {
+                console.log(`🔄 Attempting to send email via user's Gmail: ${userEmailCredentials.email}`);
+                transporter = this.createUserEmailTransporter(userEmailCredentials.email, userEmailCredentials.appPassword);
+                fromEmail = userEmailCredentials.email;
+                method = 'user_gmail';
+            } else {
+                // Fallback to your email
+                console.log('🔄 Using fallback SMTP email...');
+                transporter = this.createFallbackEmailTransporter();
+                fromEmail = process.env.EMAIL_USER;
+                method = 'fallback_smtp';
+            }
+
             const mailOptions = {
-                from: `${senderInfo.fullName} <${process.env.EMAIL_USER}>`,
+                from: `${senderInfo.fullName} <${fromEmail}>`,
                 to: recipientEmail,
                 subject: subject,
                 text: body,
                 html: body.replace(/\n/g, '<br>'),
+                replyTo: senderInfo.email, // Always set reply-to as user's actual email
                 attachments: resumePath ? [
                     {
                         filename: `${senderInfo.fullName.replace(/\s+/g, '_')}_Resume.pdf`,
@@ -361,11 +359,38 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
                 ] : []
             };
 
+            // Test the connection first
+            await transporter.verify();
+
             const info = await transporter.sendMail(mailOptions);
-            return { success: true, messageId: info.messageId };
+            console.log(`✅ Email sent successfully via ${method}:`);
+            console.log(`   From: ${fromEmail}`);
+            console.log(`   Reply-To: ${senderInfo.email}`);
+            console.log(`   Message ID: ${info.messageId}`);
+            
+            return { 
+                success: true, 
+                messageId: info.messageId, 
+                method: method,
+                senderEmail: fromEmail,
+                replyToEmail: senderInfo.email
+            };
         } catch (error) {
-            console.error('Error sending email:', error);
-            return { success: false, error: error.message };
+            console.error('❌ Error sending email:', error);
+            
+            // Provide specific error messages
+            if (error.code === 'EAUTH') {
+                return { 
+                    success: false, 
+                    error: 'Email authentication failed. Please check your app password.',
+                    needsCredentials: true
+                };
+            }
+            
+            return { 
+                success: false, 
+                error: error.message 
+            };
         }
     }
 

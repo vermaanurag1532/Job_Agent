@@ -38,7 +38,9 @@ try {
         getCampaignAnalytics: (req, res) => res.status(500).json({ error: 'CampaignController not available' }),
         getCampaignById: (req, res) => res.status(500).json({ error: 'CampaignController not available' }),
         sendFollowUp: (req, res) => res.status(500).json({ error: 'CampaignController not available' }),
-        retryCampaign: (req, res) => res.status(500).json({ error: 'CampaignController not available' })
+        retryCampaign: (req, res) => res.status(500).json({ error: 'CampaignController not available' }),
+        deleteCampaign: (req, res) => res.status(500).json({ error: 'CampaignController not available' }),
+        searchCampaigns: (req, res) => res.status(500).json({ error: 'CampaignController not available' })
     };
 }
 
@@ -73,6 +75,16 @@ router.get('/campaigns/analytics', (req, res, next) => {
     }
 });
 
+// NEW: Search campaigns
+router.get('/campaigns/search', (req, res, next) => {
+    if (typeof campaignController.searchCampaigns === 'function') {
+        campaignController.searchCampaigns(req, res, next);
+    } else {
+        console.error('❌ campaignController.searchCampaigns is not a function');
+        res.status(500).json({ error: 'Search campaigns functionality not available' });
+    }
+});
+
 router.get('/campaigns/:id', (req, res, next) => {
     if (typeof campaignController.getCampaignById === 'function') {
         campaignController.getCampaignById(req, res, next);
@@ -97,6 +109,16 @@ router.post('/campaigns/:id/retry', (req, res, next) => {
     } else {
         console.error('❌ campaignController.retryCampaign is not a function');
         res.status(500).json({ error: 'Retry campaign functionality not available' });
+    }
+});
+
+// NEW: Delete campaign
+router.delete('/campaigns/:id', (req, res, next) => {
+    if (typeof campaignController.deleteCampaign === 'function') {
+        campaignController.deleteCampaign(req, res, next);
+    } else {
+        console.error('❌ campaignController.deleteCampaign is not a function');
+        res.status(500).json({ error: 'Delete campaign functionality not available' });
     }
 });
 

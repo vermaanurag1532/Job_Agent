@@ -38,7 +38,8 @@ class CronService {
                             subject, 
                             body, 
                             campaign.sender_info, 
-                            null // No attachment for follow-ups
+                            null, // No attachment for follow-ups
+                            campaign.user_id
                         );
 
                         if (emailResult.success) {

@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Google OAuth Strategy
+// Simple Google OAuth Strategy - Only for basic profile
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET,
@@ -15,13 +15,6 @@ passport.use(new GoogleStrategy({
 }, async (accessToken, refreshToken, profile, done) => {
     try {
         console.log('Google OAuth callback triggered for:', profile.emails?.[0]?.value || 'unknown email');
-        console.log('🔍 Full profile data:', {
-            id: profile.id,
-            displayName: profile.displayName,
-            emails: profile.emails,
-            photos: profile.photos,
-            provider: profile.provider
-        });
         
         // Safely extract email
         const email = profile.emails && profile.emails.length > 0 
@@ -45,7 +38,11 @@ passport.use(new GoogleStrategy({
             profilePicture: profilePicture
         };
 
-        console.log('✅ Processing user data:', userData);
+        console.log('✅ Processing user data:', {
+            email: userData.email,
+            googleUserId: userData.googleUserId,
+            fullName: userData.fullName
+        });
 
         const user = await userRepository.findOrCreateUser(userData);
         
@@ -56,7 +53,7 @@ passport.use(new GoogleStrategy({
     }
 }));
 
-// JWT Strategy
+// JWT Strategy (unchanged)
 passport.use(new JwtStrategy({
     jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
     secretOrKey: process.env.JWT_SECRET

@@ -1,13 +1,17 @@
 import { query } from '../config/database.js';
+import { encryptToken, decryptToken } from '../utils/encryption.js';
 
 class UserRepository {
-    // Create a new user
+    // Create a new user with basic Google info
     async createUser({ email, googleUserId, fullName, profilePicture }) {
         const sql = `
-            INSERT INTO users (email, google_user_id, full_name, profile_picture, last_login)
+            INSERT INTO users (
+                email, google_user_id, full_name, profile_picture, last_login
+            )
             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
             RETURNING user_id, email, google_user_id, full_name, profile_picture, created_at, last_login
         `;
+        
         const result = await query(sql, [email, googleUserId, fullName, profilePicture]);
         return result.rows[0];
     }
@@ -16,7 +20,7 @@ class UserRepository {
     async findByEmail(email) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active
+                   created_at, updated_at, last_login, is_active, has_email_credentials
             FROM users 
             WHERE email = $1 AND is_active = true
         `;
@@ -28,7 +32,7 @@ class UserRepository {
     async findByGoogleId(googleUserId) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active
+                   created_at, updated_at, last_login, is_active, has_email_credentials
             FROM users 
             WHERE google_user_id = $1 AND is_active = true
         `;
@@ -40,12 +44,32 @@ class UserRepository {
     async findById(userId) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active
+                   created_at, updated_at, last_login, is_active, has_email_credentials
             FROM users 
             WHERE user_id = $1 AND is_active = true
         `;
         const result = await query(sql, [userId]);
         return result.rows[0] || null;
+    }
+
+    // Get user with email credentials
+    async findByIdWithEmailCredentials(userId) {
+        const sql = `
+            SELECT user_id, email, google_user_id, full_name, profile_picture, 
+                   created_at, updated_at, last_login, is_active, has_email_credentials,
+                   email_password
+            FROM users 
+            WHERE user_id = $1 AND is_active = true
+        `;
+        const result = await query(sql, [userId]);
+        const user = result.rows[0];
+        
+        if (user && user.email_password) {
+            // Decrypt email password before returning
+            user.email_password = decryptToken(user.email_password);
+        }
+        
+        return user || null;
     }
 
     // Update user's last login
@@ -73,6 +97,35 @@ class UserRepository {
         return result.rows[0];
     }
 
+    // Store user's email credentials (encrypted)
+    async updateEmailCredentials(userId, emailPassword) {
+        const sql = `
+            UPDATE users 
+            SET email_password = $2, 
+                has_email_credentials = true
+            WHERE user_id = $1
+            RETURNING user_id, has_email_credentials
+        `;
+        
+        const encryptedPassword = encryptToken(emailPassword);
+        const result = await query(sql, [userId, encryptedPassword]);
+        return result.rows[0];
+    }
+
+    // Remove user's email credentials
+    async removeEmailCredentials(userId) {
+        const sql = `
+            UPDATE users 
+            SET email_password = NULL, 
+                has_email_credentials = false
+            WHERE user_id = $1
+            RETURNING user_id, has_email_credentials
+        `;
+        
+        const result = await query(sql, [userId]);
+        return result.rows[0];
+    }
+
     // Soft delete user
     async deactivateUser(userId) {
         const sql = `
@@ -85,7 +138,7 @@ class UserRepository {
         return result.rows[0];
     }
 
-    // Find or create user (for OAuth)
+    // Find or create user (simplified version)
     async findOrCreateUser({ email, googleUserId, fullName, profilePicture }) {
         // First, try to find existing user
         let user = await this.findByGoogleId(googleUserId);
@@ -98,10 +151,12 @@ class UserRepository {
                 // User exists but doesn't have Google ID, update it
                 const updateSql = `
                     UPDATE users 
-                    SET google_user_id = $1, last_login = CURRENT_TIMESTAMP
+                    SET google_user_id = $1, 
+                        last_login = CURRENT_TIMESTAMP
                     WHERE user_id = $2
-                    RETURNING user_id, email, google_user_id, full_name, profile_picture, created_at, last_login
+                    RETURNING user_id, email, google_user_id, full_name, profile_picture, created_at, last_login, has_email_credentials
                 `;
+                
                 const result = await query(updateSql, [googleUserId, user.user_id]);
                 return result.rows[0];
             } else {
@@ -111,7 +166,7 @@ class UserRepository {
         } else {
             // User found, update last login
             await this.updateLastLogin(user.user_id);
-            return user;
+            return await this.findById(user.user_id);
         }
     }
 

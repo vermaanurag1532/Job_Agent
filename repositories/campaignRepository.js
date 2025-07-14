@@ -29,7 +29,19 @@ class CampaignRepository {
             WHERE id = $1 AND user_id = $2
         `;
         const result = await query(sql, [campaignId, userId]);
-        return result.rows[0] || null;
+        const campaign = result.rows[0];
+        
+        // Parse sender_info if it exists and is a string
+        if (campaign && campaign.sender_info && typeof campaign.sender_info === 'string') {
+            try {
+                campaign.sender_info = JSON.parse(campaign.sender_info);
+            } catch (error) {
+                console.error('Error parsing sender_info JSON:', error);
+                campaign.sender_info = null;
+            }
+        }
+        
+        return campaign || null;
     }
 
     // Add new campaign
@@ -65,7 +77,7 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // 🔥 FIXED: Update campaign - Proper SQL parameterized queries
+    // 🔥 FIXED: Update campaign - Proper SQL parameterized queries with JSON handling
     async updateCampaign(campaignId, userId, updateData) {
         const allowedFields = [
             'status', 'email_sent', 'last_follow_up', 'follow_up_count',
@@ -79,8 +91,14 @@ class CampaignRepository {
         Object.keys(updateData).forEach(key => {
             const dbField = key.replace(/([A-Z])/g, '_$1').toLowerCase();
             if (allowedFields.includes(dbField)) {
-                updates.push(`${dbField} = $${paramCount}`); // 🔥 FIXED: Proper placeholder
-                values.push(updateData[key]);
+                updates.push(`${dbField} = $${paramCount}`);
+                
+                // Handle JSON fields properly
+                if (dbField === 'sender_info' && typeof updateData[key] === 'object') {
+                    values.push(JSON.stringify(updateData[key]));
+                } else {
+                    values.push(updateData[key]);
+                }
                 paramCount++;
             }
         });
@@ -131,6 +149,19 @@ class CampaignRepository {
             )
         `;
         const result = await query(sql);
+        
+        // Parse sender_info for each campaign
+        result.rows.forEach(campaign => {
+            if (campaign.sender_info && typeof campaign.sender_info === 'string') {
+                try {
+                    campaign.sender_info = JSON.parse(campaign.sender_info);
+                } catch (error) {
+                    console.error('Error parsing sender_info JSON for follow-up:', error);
+                    campaign.sender_info = null;
+                }
+            }
+        });
+        
         return result.rows;
     }
 
@@ -225,11 +256,18 @@ class CampaignRepository {
         return await this.updateCampaign(campaignId, userId, updateData);
     }
 
-    async markAsSent(campaignId, userId) {
-        return await this.updateCampaign(campaignId, userId, {
+    async markAsSent(campaignId, userId, emailContent = null) {
+        const updateData = {
             status: 'sent',
             emailSent: new Date().toISOString()
-        });
+        };
+        
+        if (emailContent) {
+            updateData.originalEmail = emailContent;
+            updateData.emailPreview = emailContent.substring(0, 500) + '...';
+        }
+        
+        return await this.updateCampaign(campaignId, userId, updateData);
     }
 
     async markAsFailed(campaignId, userId, errorMessage) {
@@ -254,14 +292,38 @@ class CampaignRepository {
 
     async addSenderInfo(campaignId, userId, senderInfo) {
         return await this.updateCampaign(campaignId, userId, {
-            senderInfo: JSON.stringify(senderInfo)
+            senderInfo: senderInfo // Will be automatically JSON.stringify'd in updateCampaign
         });
     }
 
     async addEmailContent(campaignId, userId, emailContent) {
         return await this.updateCampaign(campaignId, userId, {
-            originalEmail: emailContent
+            originalEmail: emailContent,
+            emailPreview: emailContent.substring(0, 500) + '...'
         });
+    }
+
+    // 🔥 NEW: Method to update campaign with all email data at once
+    async updateCampaignWithEmailData(campaignId, userId, emailData) {
+        const { status, emailContent, senderInfo, errorMessage } = emailData;
+        
+        const updateData = {
+            status,
+            emailSent: status === 'sent' ? new Date().toISOString() : null,
+            originalEmail: emailContent,
+            emailPreview: emailContent ? emailContent.substring(0, 500) + '...' : null,
+            senderInfo: senderInfo,
+            errorMessage: errorMessage || null
+        };
+
+        // Remove null values
+        Object.keys(updateData).forEach(key => {
+            if (updateData[key] === null || updateData[key] === undefined) {
+                delete updateData[key];
+            }
+        });
+
+        return await this.updateCampaign(campaignId, userId, updateData);
     }
 }
 

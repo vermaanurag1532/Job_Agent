@@ -69,3 +69,22 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 
 CREATE TRIGGER update_campaigns_updated_at BEFORE UPDATE ON campaigns
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Add new columns to users table
+ALTER TABLE users ADD COLUMN google_access_token TEXT;
+ALTER TABLE users ADD COLUMN google_refresh_token TEXT;
+ALTER TABLE users ADD COLUMN google_token_expires_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN gmail_permission_granted BOOLEAN DEFAULT false;
+
+-- Add indexes for performance
+CREATE INDEX idx_users_gmail_permission ON users(gmail_permission_granted);
+CREATE INDEX idx_users_token_expiry ON users(google_token_expires_at);
+
+ALTER TABLE users ADD COLUMN email_password TEXT;
+ALTER TABLE users ADD COLUMN has_email_credentials BOOLEAN DEFAULT false;
+
+-- Remove Gmail-specific columns (since we're not using OAuth anymore)
+ALTER TABLE users DROP COLUMN IF EXISTS google_access_token;
+ALTER TABLE users DROP COLUMN IF EXISTS google_refresh_token;
+ALTER TABLE users DROP COLUMN IF EXISTS google_token_expires_at;
+ALTER TABLE users DROP COLUMN IF EXISTS gmail_permission_granted;
