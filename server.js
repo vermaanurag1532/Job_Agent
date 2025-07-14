@@ -45,7 +45,8 @@ const PgSession = connectPgSimple(session);
 
 // Middleware
 app.use(cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3001',
+    origin: 'https://job-agent-front-end.vercel.app',
+    // origin: process.env.FRONTEND_URL || 'http://localhost:3001',
     credentials: true
 }));
 
