@@ -63,11 +63,13 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: process.env.NODE_ENV === 'production',
+        secure: process.env.NODE_ENV === 'production',  // ✅ must be true in production
         httpOnly: true,
-        maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+        sameSite: 'none',                                // ✅ required for cross-origin cookies
+        maxAge: 7 * 24 * 60 * 60 * 1000                  // 7 days
     }
 }));
+
 
 // Initialize Passport
 app.use(passport.initialize());
