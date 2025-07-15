@@ -39,9 +39,8 @@ router.get('/google/callback',
             res.cookie('auth_token', token, {
                 httpOnly: true,
                 secure: process.env.NODE_ENV === 'production',
-                sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+                sameSite: 'none',
                 maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-                domain: process.env.NODE_ENV === 'production' ? '.vercel.app' : undefined
             });
 
             // Redirect to frontend
@@ -227,9 +226,8 @@ router.post('/refresh', async (req, res) => {
         res.cookie('auth_token', result.token, {
             httpOnly: true,
             secure: process.env.NODE_ENV === 'production',
-            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+            sameSite: 'none',
             maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-            domain: process.env.NODE_ENV === 'production' ? '.vercel.app' : undefined
         });
 
         res.json({ 
