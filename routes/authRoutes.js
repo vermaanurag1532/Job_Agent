@@ -39,10 +39,10 @@ router.get('/google/callback',
             res.cookie('auth_token', token, {
                 httpOnly: true,
                 secure: process.env.NODE_ENV === 'production',
-                sameSite: 'none',
+                sameSite: 'lax',
                 maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-                // domain: omitted for default (recommended)
-              });
+                domain: 'localhost'
+            });
 
             // Redirect to frontend
             const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/?auth=success`;
@@ -255,6 +255,7 @@ router.get('/status', async (req, res) => {
         
         const { userRepository } = await import('../repositories/userRepository.js');
         const user = await userRepository.findById(decoded.userId);
+        console.log(user);
         
         if (!user) {
             return res.json({ authenticated: false });
