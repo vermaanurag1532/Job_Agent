@@ -246,8 +246,8 @@ router.post('/refresh', async (req, res) => {
 router.get('/status', async (req, res) => {
     try {
         const token = req.cookies.auth_token || req.headers.authorization?.split(' ')[1];
-        
         if (!token) {
+            console.log("ANuragVerma")
             return res.json({ authenticated: false });
         }
 
