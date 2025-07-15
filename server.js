@@ -45,8 +45,11 @@ const PgSession = connectPgSimple(session);
 
 // Middleware
 app.use(cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:3001',
-    credentials: true
+    origin: ['https://www.redlinear.com', 'http://localhost:3001'], // Allow both production and dev
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+    exposedHeaders: ['set-cookie']
 }));
 
 app.use(express.json({ limit: '10mb' }));
@@ -63,10 +66,11 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: process.env.NODE_ENV === 'production',  // ✅ must be true in production
+        secure: true,  // Always true for HTTPS
         httpOnly: true,
-        sameSite: 'none',
-        maxAge: 7 * 24 * 60 * 60 * 1000                  // 7 days
+        sameSite: 'none',  // Required for cross-origin
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+        domain: undefined  // Don't set domain for cross-origin
     }
 }));
 

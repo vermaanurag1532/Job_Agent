@@ -38,9 +38,10 @@ router.get('/google/callback',
             // Set token in HTTP-only cookie
             res.cookie('auth_token', token, {
                 httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
+                secure: true,
                 sameSite: 'none',
                 maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+                domain: undefined
             });
 
             // Redirect to frontend
@@ -225,9 +226,10 @@ router.post('/refresh', async (req, res) => {
         // Set new token in cookie
         res.cookie('auth_token', result.token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
+            secure: true,
             sameSite: 'none',
             maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+            domain: undefined
         });
 
         res.json({ 
