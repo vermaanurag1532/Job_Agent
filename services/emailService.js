@@ -24,7 +24,154 @@ try {
     console.error('Failed to initialize Google Generative AI:', error);
 }
 
+// Circuit breaker for handling API failures
+class CircuitBreaker {
+    constructor(threshold = 5, timeout = 60000) {
+        this.threshold = threshold;
+        this.timeout = timeout;
+        this.failureCount = 0;
+        this.lastFailureTime = null;
+        this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+    }
+
+    async call(fn) {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime > this.timeout) {
+                this.state = 'HALF_OPEN';
+                console.log('Circuit breaker moving to HALF_OPEN state');
+            } else {
+                throw new Error('Circuit breaker is OPEN - service temporarily unavailable');
+            }
+        }
+
+        try {
+            const result = await fn();
+            this.reset();
+            return result;
+        } catch (error) {
+            this.recordFailure();
+            throw error;
+        }
+    }
+
+    recordFailure() {
+        this.failureCount++;
+        this.lastFailureTime = Date.now();
+        if (this.failureCount >= this.threshold) {
+            this.state = 'OPEN';
+            console.log(`Circuit breaker OPEN after ${this.failureCount} failures`);
+        }
+    }
+
+    reset() {
+        if (this.failureCount > 0) {
+            console.log('Circuit breaker reset - service recovered');
+        }
+        this.failureCount = 0;
+        this.state = 'CLOSED';
+    }
+}
+
+// Create circuit breaker instance
+const aiCircuitBreaker = new CircuitBreaker(3, 120000); // 3 failures, 2 minute timeout
+
 class EmailService {
+    constructor() {
+        this.requestCount = 0;
+        this.lastRequestTime = 0;
+        this.minRequestInterval = 1000; // 1 second between requests
+    }
+
+    // Rate limiting helper
+    async rateLimit() {
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastRequestTime;
+        
+        if (timeSinceLastRequest < this.minRequestInterval) {
+            const waitTime = this.minRequestInterval - timeSinceLastRequest;
+            console.log(`Rate limiting: waiting ${waitTime}ms`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+        
+        this.lastRequestTime = Date.now();
+        this.requestCount++;
+    }
+
+    // Retry logic with exponential backoff
+    async retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await this.rateLimit();
+                return await fn();
+            } catch (error) {
+                console.log(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
+                
+                if (attempt === maxRetries) {
+                    throw error;
+                }
+
+                // Check if it's a retryable error
+                if (error.status === 503 || error.message.includes('overloaded') || 
+                    error.message.includes('rate limit') || error.message.includes('quota')) {
+                    
+                    const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+                    console.log(`Retrying in ${delay.toFixed(0)}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } else {
+                    // Non-retryable error
+                    throw error;
+                }
+            }
+        }
+    }
+
+    // Enhanced AI generation with fallback
+    async generateWithAI(prompt, options = {}) {
+        return await aiCircuitBreaker.call(async () => {
+            return await this.retryWithBackoff(async () => {
+                if (!genAI) {
+                    throw new Error('Google Generative AI not initialized');
+                }
+
+                const model = genAI.getGenerativeModel({ 
+                    model: options.model || "gemini-1.5-flash",
+                    generationConfig: {
+                        temperature: options.temperature || 0.7,
+                        topP: options.topP || 0.8,
+                        topK: options.topK || 40,
+                        maxOutputTokens: options.maxOutputTokens || 2048,
+                    }
+                });
+
+                const result = await model.generateContent(prompt);
+                const response = await result.response;
+                return response.text();
+            });
+        });
+    }
+
+    // Generate fallback email template
+    generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName) {
+        const subject = `Application for ${jobTitle} Position at ${companyInfo.name}`;
+        
+        const body = `Dear ${recipientName || 'Hiring Manager'},
+
+I am writing to express my strong interest in the ${jobTitle} position at ${companyInfo.name}. As a ${senderInfo.currentTitle} with ${senderInfo.yearsOfExperience} of experience, I believe I would be a valuable addition to your team.
+
+My technical expertise includes ${senderInfo.keySkills.slice(0, 3).join(', ')}, which aligns well with the requirements for this role. In my current position at ${senderInfo.currentCompany}, I have successfully contributed to various projects that have enhanced my problem-solving abilities and technical skills.
+
+I am particularly drawn to ${companyInfo.name} because of your reputation in the industry and commitment to innovation. I would welcome the opportunity to discuss how my background and enthusiasm can contribute to your team's continued success.
+
+I have attached my resume for your review and would be happy to provide any additional information you may need. Thank you for considering my application.
+
+Best regards,
+${senderInfo.fullName}
+${senderInfo.email}
+${senderInfo.phone}`;
+
+        return `Subject: ${subject}\n\n${body}`;
+    }
+
     // Create email transporter for user's Gmail
     createUserEmailTransporter(userEmail, userAppPassword) {
         console.log(`🔧 Creating Gmail transporter for: ${userEmail}`);
@@ -54,10 +201,6 @@ class EmailService {
     // Extract sender information from resume
     async extractSenderInfo(resumeText) {
         try {
-            if (!genAI) {
-                throw new Error('Google Generative AI not initialized');
-            }
-
             const prompt = `
 Extract the following information from this resume text and return it as a JSON object:
 
@@ -91,54 +234,51 @@ Return ONLY a valid JSON object with these fields:
 If any information is not found, use empty string or empty array for that field.
 `;
 
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const result = await model.generateContent(prompt);
-            const response = await result.response;
-            const text = response.text();
+            const response = await this.generateWithAI(prompt);
             
             // Try to parse JSON from the response
             try {
-                const jsonMatch = text.match(/\{[\s\S]*\}/);
+                const jsonMatch = response.match(/\{[\s\S]*\}/);
                 if (jsonMatch) {
-                    return JSON.parse(jsonMatch[0]);
+                    const parsed = JSON.parse(jsonMatch[0]);
+                    console.log('✅ Successfully extracted sender info from resume');
+                    return parsed;
                 }
             } catch (e) {
                 console.error('Error parsing JSON from AI response:', e);
             }
             
             // Return default structure if parsing fails
-            return {
-                fullName: "Job Seeker",
-                email: "",
-                phone: "",
-                currentTitle: "",
-                yearsOfExperience: "",
-                keySkills: [],
-                currentCompany: "",
-                education: "",
-                location: ""
-            };
+            return this.getDefaultSenderInfo();
         } catch (error) {
             console.error('Error extracting sender info:', error);
-            return {
-                fullName: "Job Seeker",
-                email: "",
-                phone: "",
-                currentTitle: "",
-                yearsOfExperience: "",
-                keySkills: [],
-                currentCompany: "",
-                education: "",
-                location: ""
-            };
+            return this.getDefaultSenderInfo();
         }
+    }
+
+    // Default sender info structure
+    getDefaultSenderInfo() {
+        return {
+            fullName: "Job Seeker",
+            email: "",
+            phone: "",
+            currentTitle: "",
+            yearsOfExperience: "",
+            keySkills: [],
+            currentCompany: "",
+            education: "",
+            location: ""
+        };
     }
 
     // Company research function using web scraping
     async researchCompany(companyName, companyWebsite) {
         let browser;
         try {
-            browser = await puppeteer.launch({ headless: true });
+            browser = await puppeteer.launch({ 
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
             const page = await browser.newPage();
             
             const companyInfo = {
@@ -157,7 +297,10 @@ If any information is not found, use empty string or empty array for that field.
             // If website provided, scrape it
             if (companyWebsite) {
                 try {
-                    await page.goto(companyWebsite, { waitUntil: 'networkidle2', timeout: 30000 });
+                    await page.goto(companyWebsite, { 
+                        waitUntil: 'networkidle2', 
+                        timeout: 30000 
+                    });
                     
                     // Extract company description
                     const aboutSelectors = [
@@ -237,13 +380,9 @@ If any information is not found, use empty string or empty array for that field.
         }
     }
 
-    // Generate personalized email using Gemini AI
+    // Generate personalized email using Gemini AI with fallback
     async generatePersonalizedEmail(companyInfo, resumeText, senderInfo, emailType, jobTitle, recipientName, additionalInfo) {
         try {
-            if (!genAI) {
-                throw new Error('Google Generative AI not initialized');
-            }
-
             const prompt = `
 You are writing a professional cold email for a job application. Write a compelling, natural email that reads like a senior developer wrote it personally.
 
@@ -312,13 +451,24 @@ ${senderInfo.phone}
 REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natural sentences.
 `;
 
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const result = await model.generateContent(prompt);
-            const response = await result.response;
-            return response.text();
+            // Try AI generation first
+            try {
+                const aiResponse = await this.generateWithAI(prompt);
+                console.log('✅ Email generated successfully with AI');
+                return aiResponse;
+            } catch (aiError) {
+                console.error('AI generation failed:', aiError.message);
+                
+                // Use fallback template
+                console.log('📝 Using fallback email template...');
+                const fallbackEmail = this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
+                return fallbackEmail;
+            }
         } catch (error) {
-            console.error('Error generating email:', error);
-            return 'Error generating email. Please try again.';
+            console.error('Error in generatePersonalizedEmail:', error);
+            
+            // Final fallback
+            return this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
         }
     }
 
@@ -397,10 +547,6 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
     // Generate follow-up email
     async generateFollowUpEmail(originalEmail, companyName, jobTitle, senderInfo, followUpNumber) {
         try {
-            if (!genAI) {
-                throw new Error('Google Generative AI not initialized');
-            }
-
             const prompt = `
 Generate a polite follow-up email (follow-up #${followUpNumber}) for a job application. 
 
@@ -441,13 +587,56 @@ ${senderInfo.email}
 ${senderInfo.phone}
 `;
 
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const result = await model.generateContent(prompt);
-            const response = await result.response;
-            return response.text();
+            try {
+                const aiResponse = await this.generateWithAI(prompt);
+                console.log('✅ Follow-up email generated successfully with AI');
+                return aiResponse;
+            } catch (aiError) {
+                console.error('AI generation failed for follow-up:', aiError.message);
+                
+                // Fallback follow-up template
+                const fallbackFollowUp = `Subject: Following up on ${jobTitle} Application
+
+Dear Hiring Manager,
+
+I wanted to follow up on my application for the ${jobTitle} position at ${companyName} that I submitted recently. I remain very interested in this opportunity and believe my skills would be a great fit for your team.
+
+I understand you receive many applications, and I appreciate your time in reviewing mine. If you need any additional information or would like to schedule a conversation, I'm available at your convenience.
+
+Thank you for your consideration.
+
+Best regards,
+${senderInfo.fullName}
+${senderInfo.email}
+${senderInfo.phone}`;
+
+                return fallbackFollowUp;
+            }
         } catch (error) {
             console.error('Error generating follow-up email:', error);
-            return 'Error generating follow-up email.';
+            return 'Error generating follow-up email. Please try again.';
+        }
+    }
+
+    // Health check method
+    async healthCheck() {
+        try {
+            const testPrompt = "Return only the text: 'API is working'";
+            const response = await this.generateWithAI(testPrompt);
+            return { 
+                status: 'healthy', 
+                ai_service: 'operational',
+                circuit_breaker: aiCircuitBreaker.state,
+                request_count: this.requestCount
+            };
+        } catch (error) {
+            return { 
+                status: 'degraded', 
+                ai_service: 'error',
+                circuit_breaker: aiCircuitBreaker.state,
+                error: error.message,
+                request_count: this.requestCount
+            };
         }
     }
 }
