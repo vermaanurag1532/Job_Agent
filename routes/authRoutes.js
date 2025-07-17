@@ -192,14 +192,45 @@ router.post('/logout', authenticateToken, async (req, res) => {
     try {
         await authService.logout(req.user.user_id);
         
-        // Clear the auth token cookie
-        res.clearCookie('auth_token');
+        // Clear ALL possible cookies
+        const cookieOptions = {
+            httpOnly: true,
+            secure: true,
+            sameSite: 'none',
+            domain: undefined,
+            path: '/'
+        };
+        
+        // Clear the JWT auth token cookie
+        res.clearCookie('auth_token', cookieOptions);
+        
+        // Clear session cookie (if it exists)
+        res.clearCookie('connect.sid', cookieOptions);
+        
+        // Destroy the session completely
+        if (req.session) {
+            req.session.destroy((err) => {
+                if (err) {
+                    console.error('Session destruction error:', err);
+                }
+            });
+        }
         
         // Logout from Passport session
-        req.logout((err) => {
-            if (err) {
-                console.error('Passport logout error:', err);
-            }
+        if (req.logout) {
+            req.logout((err) => {
+                if (err) {
+                    console.error('Passport logout error:', err);
+                }
+            });
+        }
+
+        // Send response with additional headers to ensure cleanup
+        res.set({
+            'Clear-Site-Data': '"cookies", "storage"',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
         });
 
         res.json({ 
@@ -243,11 +274,18 @@ router.post('/refresh', async (req, res) => {
 });
 
 // Check authentication status
+// Check authentication status - FIXED
 router.get('/status', async (req, res) => {
     try {
         const token = req.cookies.auth_token || req.headers.authorization?.split(' ')[1];
+        
         if (!token) {
-            console.log("ANuragVerma")
+            // Also check if there's a session but no token - clean it up
+            if (req.session) {
+                req.session.destroy((err) => {
+                    if (err) console.error('Session cleanup error:', err);
+                });
+            }
             return res.json({ authenticated: false });
         }
 
@@ -255,9 +293,23 @@ router.get('/status', async (req, res) => {
         
         const { userRepository } = await import('../repositories/userRepository.js');
         const user = await userRepository.findById(decoded.userId);
-        console.log(user);
         
-        if (!user) {
+        if (!user || !user.is_active) {
+            // User not found or inactive - clean up session and cookies
+            if (req.session) {
+                req.session.destroy((err) => {
+                    if (err) console.error('Session cleanup error:', err);
+                });
+            }
+            
+            res.clearCookie('auth_token', {
+                httpOnly: true,
+                secure: true,
+                sameSite: 'none',
+                domain: undefined,
+                path: '/'
+            });
+            
             return res.json({ authenticated: false });
         }
         
@@ -275,6 +327,22 @@ router.get('/status', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Status check error:', error);
+        
+        // Clean up on any error
+        if (req.session) {
+            req.session.destroy((err) => {
+                if (err) console.error('Session cleanup error:', err);
+            });
+        }
+        
+        res.clearCookie('auth_token', {
+            httpOnly: true,
+            secure: true,
+            sameSite: 'none',
+            domain: undefined,
+            path: '/'
+        });
+        
         return res.json({ authenticated: false });
     }
 });

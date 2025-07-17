@@ -60,11 +60,15 @@ app.use(cookieParser());
 app.use(session({
     store: new PgSession({
         conString: `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`,
-        tableName: 'session'
+        tableName: 'session',
+        pruneSessionInterval: 60 * 15, // Prune expired sessions every 15 minutes
+        ttl: 7 * 24 * 60 * 60 // 7 days TTL
     }),
+    name: 'connect.sid', // Explicitly set session name
     secret: process.env.SESSION_SECRET || 'your-session-secret',
     resave: false,
     saveUninitialized: false,
+    rolling: true, // Reset expiration on activity
     cookie: {
         secure: true,  // Always true for HTTPS
         httpOnly: true,
