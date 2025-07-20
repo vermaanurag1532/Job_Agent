@@ -45,7 +45,7 @@ const PgSession = connectPgSimple(session);
 
 // Middleware
 app.use(cors({
-    origin: ['https://www.redlinear.com', 'http://localhost:3001'], // Allow both production and dev
+    origin: ['https://www.mmcgroups.com', 'http://localhost:3001'], // Allow both production and dev
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
