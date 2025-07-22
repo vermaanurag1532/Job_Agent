@@ -1,3 +1,4 @@
+// services/emailService.js (Updated with threading support - FIXED)
 import fs from 'fs';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import puppeteer from 'puppeteer';
@@ -5,6 +6,12 @@ import nodemailer from 'nodemailer';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { extractPDFText } from '../utils/pdfParser.js';
+import { 
+  createThreadingHeaders, 
+  formatFollowUpSubject, 
+  generateThreadId,
+  extractDomain 
+} from '../utils/emailThreading.js';
 
 // Load environment variables
 dotenv.config();
@@ -73,13 +80,13 @@ class CircuitBreaker {
 }
 
 // Create circuit breaker instance
-const aiCircuitBreaker = new CircuitBreaker(3, 120000); // 3 failures, 2 minute timeout
+const aiCircuitBreaker = new CircuitBreaker(3, 120000);
 
 class EmailService {
     constructor() {
         this.requestCount = 0;
         this.lastRequestTime = 0;
-        this.minRequestInterval = 1000; // 1 second between requests
+        this.minRequestInterval = 1000;
     }
 
     // Rate limiting helper
@@ -110,7 +117,6 @@ class EmailService {
                     throw error;
                 }
 
-                // Check if it's a retryable error
                 if (error.status === 503 || error.message.includes('overloaded') || 
                     error.message.includes('rate limit') || error.message.includes('quota')) {
                     
@@ -118,7 +124,6 @@ class EmailService {
                     console.log(`Retrying in ${delay.toFixed(0)}ms...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 } else {
-                    // Non-retryable error
                     throw error;
                 }
             }
@@ -236,7 +241,6 @@ If any information is not found, use empty string or empty array for that field.
 
             const response = await this.generateWithAI(prompt);
             
-            // Try to parse JSON from the response
             try {
                 const jsonMatch = response.match(/\{[\s\S]*\}/);
                 if (jsonMatch) {
@@ -248,7 +252,6 @@ If any information is not found, use empty string or empty array for that field.
                 console.error('Error parsing JSON from AI response:', e);
             }
             
-            // Return default structure if parsing fails
             return this.getDefaultSenderInfo();
         } catch (error) {
             console.error('Error extracting sender info:', error);
@@ -294,7 +297,6 @@ If any information is not found, use empty string or empty array for that field.
                 careers: ''
             };
 
-            // If website provided, scrape it
             if (companyWebsite) {
                 try {
                     await page.goto(companyWebsite, { 
@@ -302,7 +304,6 @@ If any information is not found, use empty string or empty array for that field.
                         timeout: 30000 
                     });
                     
-                    // Extract company description
                     const aboutSelectors = [
                         'meta[name="description"]',
                         '.about-section',
@@ -326,7 +327,6 @@ If any information is not found, use empty string or empty array for that field.
                         }
                     }
 
-                    // Try to find careers/jobs page
                     const careerLinks = await page.evaluate(() => {
                         const links = Array.from(document.querySelectorAll('a'));
                         return links
@@ -451,7 +451,6 @@ ${senderInfo.phone}
 REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natural sentences.
 `;
 
-            // Try AI generation first
             try {
                 const aiResponse = await this.generateWithAI(prompt);
                 console.log('✅ Email generated successfully with AI');
@@ -459,7 +458,6 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
             } catch (aiError) {
                 console.error('AI generation failed:', aiError.message);
                 
-                // Use fallback template
                 console.log('📝 Using fallback email template...');
                 const fallbackEmail = this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
                 return fallbackEmail;
@@ -467,13 +465,12 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
         } catch (error) {
             console.error('Error in generatePersonalizedEmail:', error);
             
-            // Final fallback
             return this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
         }
     }
 
-    // Send email function with user's credentials
-    async sendEmail(recipientEmail, subject, body, senderInfo, resumePath, userId, userEmailCredentials = null) {
+    // 🔥 UPDATED: Send email function with threading support
+    async sendEmail(recipientEmail, subject, body, senderInfo, resumePath, userId, userEmailCredentials = null, threadingOptions = {}) {
         try {
             let transporter;
             let fromEmail;
@@ -486,12 +483,22 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
                 fromEmail = userEmailCredentials.email;
                 method = 'user_gmail';
             } else {
-                // Fallback to your email
                 console.log('🔄 Using fallback SMTP email...');
                 transporter = this.createFallbackEmailTransporter();
                 fromEmail = process.env.EMAIL_USER;
                 method = 'fallback_smtp';
             }
+
+            // 🔥 UPDATED: Generate threading headers with emailReferences
+            const threadHeaders = createThreadingHeaders({
+                senderEmail: senderInfo.email || fromEmail,
+                originalMessageId: threadingOptions.originalMessageId || null,
+                threadId: threadingOptions.threadId || null,
+                emailReferences: threadingOptions.emailReferences || '',
+                isReply: threadingOptions.isReply || false
+            });
+
+            console.log('📧 Threading headers:', threadHeaders);
 
             const mailOptions = {
                 from: `${senderInfo.fullName} <${fromEmail}>`,
@@ -499,7 +506,13 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
                 subject: subject,
                 text: body,
                 html: body.replace(/\n/g, '<br>'),
-                replyTo: senderInfo.email, // Always set reply-to as user's actual email
+                replyTo: senderInfo.email,
+                // 🔥 NEW: Add threading headers
+                headers: {
+                    ...threadHeaders,
+                    'X-Campaign-Type': threadingOptions.campaignType || 'original',
+                    'X-Follow-Up-Number': threadingOptions.followUpNumber || 0
+                },
                 attachments: resumePath ? [
                     {
                         filename: `${senderInfo.fullName.replace(/\s+/g, '_')}_Resume.pdf`,
@@ -517,10 +530,13 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
             console.log(`   From: ${fromEmail}`);
             console.log(`   Reply-To: ${senderInfo.email}`);
             console.log(`   Message ID: ${info.messageId}`);
+            console.log(`   Threading: ${threadHeaders['Message-ID']}`);
             
             return { 
                 success: true, 
-                messageId: info.messageId, 
+                messageId: info.messageId,
+                threadingMessageId: threadHeaders['Message-ID'],
+                threadId: threadHeaders['X-Thread-ID'],
                 method: method,
                 senderEmail: fromEmail,
                 replyToEmail: senderInfo.email
@@ -528,7 +544,6 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
         } catch (error) {
             console.error('❌ Error sending email:', error);
             
-            // Provide specific error messages
             if (error.code === 'EAUTH') {
                 return { 
                     success: false, 
@@ -544,9 +559,16 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
         }
     }
 
-    // Generate follow-up email
-    async generateFollowUpEmail(originalEmail, companyName, jobTitle, senderInfo, followUpNumber) {
+    // 🔥 UPDATED: Generate follow-up email with proper threading
+    async generateFollowUpEmail(originalEmail, companyName, jobTitle, senderInfo, followUpNumber, originalSubject = null) {
         try {
+            // Extract original subject if not provided
+            let extractedSubject = originalSubject;
+            if (!extractedSubject && originalEmail) {
+                const subjectMatch = originalEmail.match(/Subject:\s*(.+)/);
+                extractedSubject = subjectMatch ? subjectMatch[1].trim() : `${jobTitle} Application`;
+            }
+
             const prompt = `
 Generate a polite follow-up email (follow-up #${followUpNumber}) for a job application. 
 
@@ -563,6 +585,7 @@ ${originalEmail}
 - Company: ${companyName}
 - Position: ${jobTitle}
 - Follow-up Number: ${followUpNumber}
+- Original Subject: ${extractedSubject || 'Job Application'}
 
 **Instructions:**
 1. Be polite and professional
@@ -570,12 +593,12 @@ ${originalEmail}
 3. Reiterate interest in the position
 4. Add new value (recent achievement, relevant news, etc.)
 5. Keep it shorter than the original (100-150 words)
-6. Include appropriate subject line
+6. Include appropriate subject line with "Re: " prefix for threading
 7. Be respectful of their time
 8. Use sender's actual name and contact info
 
 **Output Format:**
-Subject: [Subject line]
+Subject: Re: ${extractedSubject || `${jobTitle} position`}
 
 Dear Hiring Manager,
 
@@ -594,8 +617,10 @@ ${senderInfo.phone}
             } catch (aiError) {
                 console.error('AI generation failed for follow-up:', aiError.message);
                 
-                // Fallback follow-up template
-                const fallbackFollowUp = `Subject: Following up on ${jobTitle} Application
+                // Fallback follow-up template with proper subject formatting
+                const replySubject = formatFollowUpSubject(extractedSubject || `${jobTitle} Application`, followUpNumber);
+                
+                const fallbackFollowUp = `Subject: ${replySubject}
 
 Dear Hiring Manager,
 

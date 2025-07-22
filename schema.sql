@@ -80,3 +80,34 @@ ALTER TABLE users DROP COLUMN IF EXISTS google_access_token;
 ALTER TABLE users DROP COLUMN IF EXISTS google_refresh_token;
 ALTER TABLE users DROP COLUMN IF EXISTS google_token_expires_at;
 ALTER TABLE users DROP COLUMN IF EXISTS gmail_permission_granted;
+
+ALTER TABLE campaigns ADD COLUMN message_id VARCHAR(255);
+ALTER TABLE campaigns ADD COLUMN in_reply_to VARCHAR(255);
+ALTER TABLE campaigns ADD COLUMN email_references VARCHAR(500);
+ALTER TABLE campaigns ADD COLUMN thread_id VARCHAR(255);
+CREATE INDEX idx_campaigns_message_id ON campaigns(message_id);
+CREATE INDEX idx_campaigns_thread_id ON campaigns(thread_id);
+CREATE INDEX idx_campaigns_in_reply_to ON campaigns(in_reply_to);
+CREATE TABLE campaign_followups (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    message_id VARCHAR(255) NOT NULL,
+    in_reply_to VARCHAR(255) NOT NULL,
+    email_references VARCHAR(500),
+    subject VARCHAR(500) NOT NULL,
+    email_content TEXT NOT NULL,
+    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    followup_number INTEGER NOT NULL,
+    status VARCHAR(50) DEFAULT 'sent',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_followups_campaign_id ON campaign_followups(campaign_id);
+CREATE INDEX idx_followups_message_id ON campaign_followups(message_id);
+CREATE INDEX idx_followups_in_reply_to ON campaign_followups(in_reply_to);
+ALTER TABLE campaigns RENAME COLUMN "references" TO email_references;
+ALTER TABLE campaign_followups RENAME COLUMN "references" TO email_references;
+DROP INDEX IF EXISTS idx_campaigns_references;
+DROP INDEX IF EXISTS idx_followups_references;
+CREATE INDEX idx_campaigns_email_references ON campaigns(email_references);
+CREATE INDEX idx_followups_email_references ON campaign_followups(email_references);

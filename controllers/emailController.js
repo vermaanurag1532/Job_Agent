@@ -1,6 +1,8 @@
+// controllers/emailController.js (Updated with threading support)
 import { emailService } from '../services/emailService.js';
 import { campaignRepository } from '../repositories/campaignRepository.js';
 import { userRepository } from '../repositories/userRepository.js';
+import { generateThreadId, formatFollowUpSubject } from '../utils/emailThreading.js';
 
 class EmailController {
     async sendEmail(req, res) {
@@ -58,6 +60,9 @@ class EmailController {
             const campaign = await campaignRepository.addCampaign(campaignData);
             console.log(`✅ Campaign created with ID: ${campaign.id}`);
 
+            // 🔥 NEW: Generate thread ID for the campaign
+            const threadId = generateThreadId(campaign.id);
+
             // Background processing
             (async () => {
                 try {
@@ -81,7 +86,8 @@ class EmailController {
                     // Update status to researching and add sender info
                     await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                         status: 'researching',
-                        senderInfo: senderInfo
+                        senderInfo: senderInfo,
+                        threadId: threadId  // 🔥 NEW: Set thread ID
                     });
                     console.log(`🔍 Campaign ${campaign.id} status: researching`);
 
@@ -110,6 +116,14 @@ class EmailController {
 
                     console.log(`📧 Email generated - Subject: ${subject}`);
 
+                    // 🔥 NEW: Prepare threading options for original email
+                    const threadingOptions = {
+                        threadId: threadId,
+                        campaignType: 'original',
+                        followUpNumber: 0,
+                        isReply: false
+                    };
+
                     // Send email with resume attachment
                     const emailResult = await emailService.sendEmail(
                         recipientEmail, 
@@ -118,23 +132,31 @@ class EmailController {
                         senderInfo, 
                         req.file.path,
                         req.user.user_id,
-                        userEmailCredentials
+                        userEmailCredentials,
+                        threadingOptions  // 🔥 NEW: Include threading options
                     );
 
                     console.log(`📧 Email send result:`, {
                         success: emailResult.success,
                         method: emailResult.method,
                         senderEmail: emailResult.senderEmail,
+                        threadingMessageId: emailResult.threadingMessageId,
                         error: emailResult.error
                     });
 
                     if (emailResult.success) {
-                        // Use the new method to update all email data at once
+                        // 🔥 UPDATED: Include threading data when marking as sent
                         await campaignRepository.updateCampaignWithEmailData(campaign.id, req.user.user_id, {
                             status: 'sent',
                             emailContent: generatedEmail,
                             senderInfo: senderInfo,
-                            errorMessage: null
+                            errorMessage: null,
+                            threadingData: {  // 🔥 NEW: Threading information
+                                messageId: emailResult.threadingMessageId,
+                                threadId: threadId,
+                                inReplyTo: null,
+                                references: null
+                            }
                         });
                         
                         console.log(`✅ Campaign ${campaign.id} completed successfully via ${emailResult.method}`);
@@ -165,6 +187,7 @@ class EmailController {
                 success: true,
                 campaignId: campaign.id,
                 status: 'pending',
+                threadId: threadId,  // 🔥 NEW: Include thread ID in response
                 message: userEmailCredentials 
                     ? `Email campaign started. AI is processing your resume and will send the email from ${userEmailCredentials.email}.`
                     : 'Email campaign started. AI is processing your resume and will send the email using fallback SMTP (reply-to will be set to your email).',
@@ -182,6 +205,152 @@ class EmailController {
         } catch (error) {
             console.error('❌ Error in send-email endpoint:', error);
             res.status(500).json({ error: error.message });
+        }
+    }
+
+    // 🔥 UPDATED: Send follow-up email with proper threading
+    async sendFollowUp(req, res) {
+        try {
+            const { id } = req.params;
+            console.log(`📧 Sending follow-up for campaign ${id}`);
+            
+            const campaign = await campaignRepository.getCampaignById(id, req.user.user_id);
+            
+            if (!campaign) {
+                return res.status(404).json({ error: 'Campaign not found' });
+            }
+
+            if (campaign.status !== 'sent') {
+                return res.status(400).json({ 
+                    error: 'Can only follow up on sent campaigns' 
+                });
+            }
+
+            if (!campaign.sender_info) {
+                return res.status(400).json({ 
+                    error: 'Sender information not available' 
+                });
+            }
+
+            if (campaign.follow_up_count >= 2) {
+                return res.status(400).json({ 
+                    error: 'Maximum follow-ups (2) already sent' 
+                });
+            }
+
+            // 🔥 NEW: Check for threading information
+            if (!campaign.message_id || !campaign.thread_id) {
+                return res.status(400).json({ 
+                    error: 'Original email threading information not available' 
+                });
+            }
+
+            const followUpNumber = (campaign.follow_up_count || 0) + 1;
+
+            // Extract original subject for threading
+            const originalSubject = campaign.original_email ? 
+                campaign.original_email.match(/Subject:\s*(.+)/)?.[1]?.trim() : 
+                `${campaign.job_title} Application`;
+
+            // Generate follow-up email
+            const followUpEmail = await emailService.generateFollowUpEmail(
+                campaign.original_email,
+                campaign.company_name,
+                campaign.job_title,
+                campaign.sender_info,
+                followUpNumber,
+                originalSubject
+            );
+
+            // Extract subject and body
+            const subjectMatch = followUpEmail.match(/Subject:\s*(.+)/);
+            const subject = subjectMatch ? 
+                subjectMatch[1].trim() : 
+                formatFollowUpSubject(originalSubject, followUpNumber);
+            
+            const bodyStart = followUpEmail.indexOf('\n\n') + 2;
+            const body = followUpEmail.substring(bodyStart).trim();
+
+            // Get user's email credentials
+            const userWithCredentials = await userRepository.findByIdWithEmailCredentials(req.user.user_id);
+            const userEmailCredentials = userWithCredentials && userWithCredentials.has_email_credentials ? {
+                email: userWithCredentials.email,
+                appPassword: userWithCredentials.email_password
+            } : null;
+
+            // 🔥 NEW: Prepare threading options for follow-up email
+            const threadingOptions = {
+                originalMessageId: campaign.message_id,
+                threadId: campaign.thread_id,
+                emailReferences: campaign.email_references || campaign.message_id,
+                campaignType: 'followup',
+                followUpNumber: followUpNumber,
+                isReply: true  // 🔥 NEW: This is a reply to the original email
+            };
+
+            console.log(`📧 Follow-up threading options:`, threadingOptions);
+
+            // Send follow-up email (without attachment)
+            const emailResult = await emailService.sendEmail(
+                campaign.recipient_email, 
+                subject, 
+                body, 
+                campaign.sender_info, 
+                null, // No attachment for follow-ups
+                req.user.user_id,
+                userEmailCredentials,
+                threadingOptions  // 🔥 NEW: Include threading options for proper reply
+            );
+
+            console.log(`📧 Follow-up email result:`, {
+                success: emailResult.success,
+                method: emailResult.method,
+                threadingMessageId: emailResult.threadingMessageId,
+                inReplyTo: campaign.message_id,
+                error: emailResult.error
+            });
+
+            if (emailResult.success) {
+                // 🔥 NEW: Store follow-up in separate table for thread tracking
+                await campaignRepository.addFollowUp({
+                    campaignId: campaign.id,
+                    userId: req.user.user_id,
+                    messageId: emailResult.threadingMessageId,
+                    inReplyTo: campaign.message_id,
+                    emailReferences: threadingOptions.emailReferences,
+                    subject: subject,
+                    emailContent: followUpEmail,
+                    followupNumber: followUpNumber
+                });
+
+                // Update campaign with follow-up info and latest threading data
+                await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
+                    followUpCount: followUpNumber,
+                    lastFollowUp: new Date(),
+                    emailReferences: `${threadingOptions.emailReferences} ${emailResult.threadingMessageId}`.trim()
+                });
+                
+                res.json({
+                    success: true,
+                    message: `Follow-up email sent successfully via ${emailResult.method}`,
+                    followUpCount: followUpNumber,
+                    method: emailResult.method,
+                    threadingInfo: {
+                        messageId: emailResult.threadingMessageId,
+                        inReplyTo: campaign.message_id,
+                        threadId: campaign.thread_id,
+                        isThreaded: true
+                    }
+                });
+            } else {
+                res.status(500).json({ 
+                    error: `Failed to send follow-up: ${emailResult.error}` 
+                });
+            }
+
+        } catch (error) {
+            console.error('Error sending follow-up:', error);
+            res.status(500).json({ error: 'Failed to send follow-up email' });
         }
     }
 
@@ -205,7 +374,15 @@ class EmailController {
                 lastFollowUp: campaign.last_follow_up,
                 followUpCount: campaign.follow_up_count,
                 errorMessage: campaign.error_message,
-                emailPreview: campaign.email_preview
+                emailPreview: campaign.email_preview,
+                // 🔥 NEW: Include threading information
+                threadingInfo: {
+                    messageId: campaign.message_id,
+                    threadId: campaign.thread_id,
+                    inReplyTo: campaign.in_reply_to,
+                    emailReferences: campaign.email_references,
+                    hasThread: !!(campaign.message_id && campaign.thread_id)
+                }
             }));
 
             res.json({
@@ -330,6 +507,9 @@ class EmailController {
                 return res.status(404).json({ error: 'Campaign not found' });
             }
 
+            // 🔥 NEW: Get email thread information
+            const emailThread = await campaignRepository.getEmailThread(id, req.user.user_id);
+
             // Format campaign data (exclude sensitive file paths)
             const campaignData = {
                 id: campaign.id,
@@ -348,8 +528,18 @@ class EmailController {
                 followUpCount: campaign.follow_up_count,
                 originalEmail: campaign.original_email,
                 emailPreview: campaign.email_preview,
-                senderInfo: campaign.sender_info, // Already parsed in repository
-                errorMessage: campaign.error_message
+                senderInfo: campaign.sender_info,
+                errorMessage: campaign.error_message,
+                // 🔥 NEW: Include threading information
+                threadingInfo: {
+                    messageId: campaign.message_id,
+                    threadId: campaign.thread_id,
+                    inReplyTo: campaign.in_reply_to,
+                    emailReferences: campaign.email_references,
+                    hasThread: !!(campaign.message_id && campaign.thread_id)
+                },
+                // 🔥 NEW: Include full email thread
+                emailThread: emailThread
             };
 
             res.json({
@@ -359,103 +549,6 @@ class EmailController {
         } catch (error) {
             console.error('Error getting campaign by ID:', error);
             res.status(500).json({ error: 'Failed to retrieve campaign' });
-        }
-    }
-
-    // Send follow-up email
-    async sendFollowUp(req, res) {
-        try {
-            const { id } = req.params;
-            console.log(`📧 Sending follow-up for campaign ${id}`);
-            
-            const campaign = await campaignRepository.getCampaignById(id, req.user.user_id);
-            
-            if (!campaign) {
-                return res.status(404).json({ error: 'Campaign not found' });
-            }
-
-            if (campaign.status !== 'sent') {
-                return res.status(400).json({ 
-                    error: 'Can only follow up on sent campaigns' 
-                });
-            }
-
-            if (!campaign.sender_info) {
-                return res.status(400).json({ 
-                    error: 'Sender information not available' 
-                });
-            }
-
-            if (campaign.follow_up_count >= 2) {
-                return res.status(400).json({ 
-                    error: 'Maximum follow-ups (2) already sent' 
-                });
-            }
-
-            // Generate follow-up email
-            const followUpEmail = await emailService.generateFollowUpEmail(
-                campaign.original_email,
-                campaign.company_name,
-                campaign.job_title,
-                campaign.sender_info, // Already parsed object
-                campaign.follow_up_count + 1
-            );
-
-            // Extract subject and body
-            const subjectMatch = followUpEmail.match(/Subject:\s*(.+)/);
-            const subject = subjectMatch ? 
-                subjectMatch[1].trim() : 
-                `Follow-up: ${campaign.job_title} position`;
-            
-            const bodyStart = followUpEmail.indexOf('\n\n') + 2;
-            const body = followUpEmail.substring(bodyStart).trim();
-
-            // Get user's email credentials
-            const userWithCredentials = await userRepository.findByIdWithEmailCredentials(req.user.user_id);
-            const userEmailCredentials = userWithCredentials && userWithCredentials.has_email_credentials ? {
-                email: userWithCredentials.email,
-                appPassword: userWithCredentials.email_password
-            } : null;
-
-            // Send follow-up email (without attachment)
-            const emailResult = await emailService.sendEmail(
-                campaign.recipient_email, 
-                subject, 
-                body, 
-                campaign.sender_info, 
-                null, // No attachment for follow-ups
-                req.user.user_id,
-                userEmailCredentials
-            );
-
-            console.log(`📧 Follow-up email result:`, {
-                success: emailResult.success,
-                method: emailResult.method,
-                error: emailResult.error
-            });
-
-            if (emailResult.success) {
-                // Update campaign with follow-up info
-                await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
-                    followUpCount: campaign.follow_up_count + 1,
-                    lastFollowUp: new Date()
-                });
-                
-                res.json({
-                    success: true,
-                    message: `Follow-up email sent successfully via ${emailResult.method}`,
-                    followUpCount: campaign.follow_up_count + 1,
-                    method: emailResult.method
-                });
-            } else {
-                res.status(500).json({ 
-                    error: `Failed to send follow-up: ${emailResult.error}` 
-                });
-            }
-
-        } catch (error) {
-            console.error('Error sending follow-up:', error);
-            res.status(500).json({ error: 'Failed to send follow-up email' });
         }
     }
 }

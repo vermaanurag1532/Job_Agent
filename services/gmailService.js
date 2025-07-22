@@ -1,5 +1,7 @@
+// services/gmailService.js (Updated with threading support)
 import { google } from 'googleapis';
 import { userRepository } from '../repositories/userRepository.js';
+import { createThreadingHeaders, formatFollowUpSubject } from '../utils/emailThreading.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -70,7 +72,7 @@ class GmailService {
 
             await userRepository.updateGmailTokens(userId, {
                 accessToken: credentials.access_token,
-                refreshToken: credentials.refresh_token || refreshToken, // Use new refresh token if provided
+                refreshToken: credentials.refresh_token || refreshToken,
                 tokenExpiresAt: newTokenExpiresAt
             });
 
@@ -90,20 +92,52 @@ class GmailService {
         }
     }
 
-    // Send email via Gmail API
-    async sendEmailViaGmail(userId, { to, subject, body, attachments = [] }) {
+    // 🔥 UPDATED: Send email via Gmail API with threading support
+    async sendEmailViaGmail(userId, emailOptions, threadingOptions = {}) {
         try {
+            const { to, subject, body, attachments = [] } = emailOptions;
             const gmail = await this.getGmailClient(userId);
             const user = await userRepository.findById(userId);
+
+            // 🔥 NEW: Generate threading headers
+            const threadHeaders = createThreadingHeaders({
+                senderEmail: user.email,
+                originalMessageId: threadingOptions.originalMessageId || null,
+                threadId: threadingOptions.threadId || null,
+                emailReferences: threadingOptions.emailReferences || '',
+                isReply: threadingOptions.isReply || false
+            });
 
             // Create email message
             const messageParts = [];
             
-            // Headers
+            // Headers with threading support
             messageParts.push(`From: ${user.full_name} <${user.email}>`);
             messageParts.push(`To: ${to}`);
             messageParts.push(`Subject: ${subject}`);
             messageParts.push(`MIME-Version: 1.0`);
+            
+            // 🔥 NEW: Add threading headers
+            if (threadHeaders['Message-ID']) {
+                messageParts.push(`Message-ID: ${threadHeaders['Message-ID']}`);
+            }
+            if (threadHeaders['In-Reply-To']) {
+                messageParts.push(`In-Reply-To: ${threadHeaders['In-Reply-To']}`);
+            }
+            if (threadHeaders['References']) {
+                messageParts.push(`References: ${threadHeaders['References']}`);
+            }
+            if (threadHeaders['X-Thread-ID']) {
+                messageParts.push(`X-Thread-ID: ${threadHeaders['X-Thread-ID']}`);
+            }
+            
+            // 🔥 NEW: Add campaign-specific headers
+            if (threadingOptions.campaignType) {
+                messageParts.push(`X-Campaign-Type: ${threadingOptions.campaignType}`);
+            }
+            if (threadingOptions.followUpNumber) {
+                messageParts.push(`X-Follow-Up-Number: ${threadingOptions.followUpNumber}`);
+            }
             
             if (attachments.length > 0) {
                 const boundary = `boundary_${Date.now()}`;
@@ -140,20 +174,61 @@ class GmailService {
             }
 
             const message = messageParts.join('\n');
-            const encodedMessage = Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+            const encodedMessage = Buffer.from(message)
+                .toString('base64')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/, '');
+
+            // 🔥 NEW: Handle threading in Gmail API
+            const requestBody = {
+                raw: encodedMessage
+            };
+
+            // If this is a reply, try to find the original thread
+            if (threadingOptions.isReply && threadingOptions.originalMessageId) {
+                try {
+                    // Search for the original message thread
+                    const searchResults = await gmail.users.messages.list({
+                        userId: 'me',
+                        q: `in:sent ${threadingOptions.originalMessageId.replace(/[<>]/g, '')}`
+                    });
+
+                    if (searchResults.data.messages && searchResults.data.messages.length > 0) {
+                        // Get the thread ID of the original message
+                        const originalMessage = await gmail.users.messages.get({
+                            userId: 'me',
+                            id: searchResults.data.messages[0].id
+                        });
+
+                        if (originalMessage.data.threadId) {
+                            requestBody.threadId = originalMessage.data.threadId;
+                            console.log(`🔗 Replying to thread: ${originalMessage.data.threadId}`);
+                        }
+                    }
+                } catch (threadError) {
+                    console.warn('Could not find original thread, sending as new message:', threadError.message);
+                }
+            }
 
             // Send the email
             const response = await gmail.users.messages.send({
                 userId: 'me',
-                requestBody: {
-                    raw: encodedMessage
-                }
+                requestBody: requestBody
             });
 
             console.log('✅ Email sent successfully via Gmail API:', response.data.id);
+            console.log(`   Threading Message-ID: ${threadHeaders['Message-ID']}`);
+            if (threadHeaders['In-Reply-To']) {
+                console.log(`   In-Reply-To: ${threadHeaders['In-Reply-To']}`);
+            }
+            
             return { 
                 success: true, 
-                messageId: response.data.id, 
+                messageId: response.data.id,
+                threadingMessageId: threadHeaders['Message-ID'],
+                threadId: threadHeaders['X-Thread-ID'],
+                gmailThreadId: response.data.threadId,
                 method: 'gmail_api',
                 senderEmail: user.email
             };
@@ -184,6 +259,139 @@ class GmailService {
         }
     }
 
+    // 🔥 NEW: Send follow-up email via Gmail API with proper threading
+    async sendFollowUpViaGmail(userId, followUpOptions) {
+        const {
+            to,
+            originalSubject,
+            body,
+            originalMessageId,
+            threadId,
+            emailReferences,
+            followUpNumber,
+            attachments = []
+        } = followUpOptions;
+
+        // Format subject for follow-up
+        const subject = formatFollowUpSubject(originalSubject, followUpNumber, true);
+
+        const emailOptions = {
+            to,
+            subject,
+            body,
+            attachments
+        };
+
+        const threadingOptions = {
+            originalMessageId,
+            threadId,
+            emailReferences,
+            isReply: true,
+            campaignType: 'followup',
+            followUpNumber
+        };
+
+        return await this.sendEmailViaGmail(userId, emailOptions, threadingOptions);
+    }
+
+    // 🔥 NEW: Get email thread from Gmail
+    async getEmailThread(userId, threadId) {
+        try {
+            const gmail = await this.getGmailClient(userId);
+            
+            const thread = await gmail.users.threads.get({
+                userId: 'me',
+                id: threadId,
+                format: 'full'
+            });
+
+            const messages = thread.data.messages.map(message => ({
+                id: message.id,
+                threadId: message.threadId,
+                snippet: message.snippet,
+                payload: message.payload,
+                headers: message.payload.headers.reduce((acc, header) => {
+                    acc[header.name.toLowerCase()] = header.value;
+                    return acc;
+                }, {}),
+                body: this.extractMessageBody(message.payload),
+                date: new Date(parseInt(message.internalDate))
+            }));
+
+            return {
+                success: true,
+                threadId: thread.data.id,
+                historyId: thread.data.historyId,
+                messages: messages
+            };
+        } catch (error) {
+            console.error('Error getting email thread:', error);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+
+    // Helper method to extract message body
+    extractMessageBody(payload) {
+        let body = '';
+        
+        if (payload.body && payload.body.data) {
+            body = Buffer.from(payload.body.data, 'base64').toString('utf-8');
+        } else if (payload.parts) {
+            for (const part of payload.parts) {
+                if (part.mimeType === 'text/plain' && part.body && part.body.data) {
+                    body = Buffer.from(part.body.data, 'base64').toString('utf-8');
+                    break;
+                }
+            }
+        }
+        
+        return body;
+    }
+
+    // 🔥 NEW: Search for messages with specific Message-ID
+    async findMessageByMessageId(userId, messageId) {
+        try {
+            const gmail = await this.getGmailClient(userId);
+            
+            // Clean Message-ID for search
+            const cleanMessageId = messageId.replace(/[<>]/g, '');
+            
+            const searchResults = await gmail.users.messages.list({
+                userId: 'me',
+                q: `rfc822msgid:${cleanMessageId}`
+            });
+
+            if (searchResults.data.messages && searchResults.data.messages.length > 0) {
+                const message = await gmail.users.messages.get({
+                    userId: 'me',
+                    id: searchResults.data.messages[0].id,
+                    format: 'full'
+                });
+
+                return {
+                    success: true,
+                    message: {
+                        id: message.data.id,
+                        threadId: message.data.threadId,
+                        headers: message.data.payload.headers.reduce((acc, header) => {
+                            acc[header.name.toLowerCase()] = header.value;
+                            return acc;
+                        }, {}),
+                        body: this.extractMessageBody(message.data.payload)
+                    }
+                };
+            }
+
+            return { success: false, error: 'Message not found' };
+        } catch (error) {
+            console.error('Error finding message by Message-ID:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
     // Check if user has Gmail permissions
     async hasGmailPermissions(userId) {
         try {
@@ -208,10 +416,65 @@ class GmailService {
             return {
                 success: true,
                 email: profile.data.emailAddress,
-                messagesTotal: profile.data.messagesTotal
+                messagesTotal: profile.data.messagesTotal,
+                threadsTotal: profile.data.threadsTotal
             };
         } catch (error) {
             console.error('Gmail connection test failed:', error);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+
+    // 🔥 NEW: Get threading statistics for user
+    async getThreadingStats(userId) {
+        try {
+            const gmail = await this.getGmailClient(userId);
+            
+            // Search for emails with campaign headers
+            const campaignEmails = await gmail.users.messages.list({
+                userId: 'me',
+                q: 'has:attachment OR subject:"Application for" OR subject:"Follow-up"',
+                maxResults: 100
+            });
+
+            let threadedCount = 0;
+            let totalCampaignEmails = 0;
+
+            if (campaignEmails.data.messages) {
+                totalCampaignEmails = campaignEmails.data.messages.length;
+                
+                // Check how many are part of threads
+                for (const message of campaignEmails.data.messages.slice(0, 10)) {
+                    try {
+                        const fullMessage = await gmail.users.messages.get({
+                            userId: 'me',
+                            id: message.id
+                        });
+                        
+                        if (fullMessage.data.threadId && 
+                            fullMessage.data.threadId !== fullMessage.data.id) {
+                            threadedCount++;
+                        }
+                    } catch (e) {
+                        // Skip if can't access message
+                    }
+                }
+            }
+
+            return {
+                success: true,
+                stats: {
+                    totalCampaignEmails,
+                    threadedEmails: threadedCount,
+                    threadingRate: totalCampaignEmails > 0 ? 
+                        ((threadedCount / Math.min(totalCampaignEmails, 10)) * 100).toFixed(1) : 0
+                }
+            };
+        } catch (error) {
+            console.error('Error getting threading stats:', error);
             return {
                 success: false,
                 error: error.message

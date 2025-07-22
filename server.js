@@ -10,19 +10,24 @@ import connectPgSimple from 'connect-pg-simple';
 import cookieParser from 'cookie-parser';
 
 // Import configurations
-import './config/database.js'; // Initialize database connection
+import './config/database.js'; 
 import passport from './config/passport.js';
 
-// Import routes - FIXED: Use consistent default imports
+// Import routes
 import authRoutes from './routes/authRoutes.js';
 import emailRoutes from './routes/emailRoutes.js';
 import campaignRoutes from './routes/campaignRoutes.js';
 
-// Import services
-import { startAutomatedFollowUp, startCleanupJob, startHealthCheck } from './services/cronService.js';
-
 // Import middleware
-import { securityHeaders, handleCORS } from './middleware/authMiddleware.js';
+import { securityHeaders, handleCORS, authenticateToken } from './middleware/authMiddleware.js';
+
+// Import services - UPDATED: Include threading maintenance
+import { 
+    startAutomatedFollowUp, 
+    startCleanupJob, 
+    startHealthCheck,
+    startThreadingMaintenance  // 🔥 NEW: Threading maintenance service
+} from './services/cronService.js';
 
 // Load environment variables
 dotenv.config();
@@ -78,7 +83,6 @@ app.use(session({
     }
 }));
 
-
 // Initialize Passport
 app.use(passport.initialize());
 app.use(passport.session());
@@ -100,6 +104,195 @@ app.use('/auth', authRoutes);
 app.use('/api', emailRoutes);
 app.use('/api', campaignRoutes);
 
+// 🔥 NEW: Threading-specific API endpoints
+app.get('/api/threading/stats/:campaignId', authenticateToken, async (req, res) => {
+    try {
+        const { campaignId } = req.params;
+        const { campaignRepository } = await import('./repositories/campaignRepository.js');
+        
+        const emailThread = await campaignRepository.getEmailThread(campaignId, req.user.user_id);
+        
+        if (!emailThread) {
+            return res.status(404).json({ error: 'Campaign not found' });
+        }
+
+        const threadingStats = {
+            hasOriginalEmail: !!emailThread.original.messageId,
+            followUpCount: emailThread.followUps.length,
+            threadId: emailThread.original.threadId,
+            isThreaded: !!(emailThread.original.messageId && emailThread.original.threadId),
+            followUps: emailThread.followUps.map(followUp => ({
+                followUpNumber: followUp.followUpNumber,
+                messageId: followUp.messageId,
+                inReplyTo: followUp.inReplyTo,
+                sentAt: followUp.sentAt,
+                isProperlyThreaded: followUp.inReplyTo === emailThread.original.messageId
+            }))
+        };
+
+        res.json({
+            success: true,
+            threadingStats,
+            emailThread
+        });
+    } catch (error) {
+        console.error('Error getting threading stats:', error);
+        res.status(500).json({ error: 'Failed to get threading statistics' });
+    }
+});
+
+// 🔥 NEW: Threading health check endpoint
+app.get('/api/threading/health', authenticateToken, async (req, res) => {
+    try {
+        const { query } = await import('./config/database.js');
+        
+        // Check campaigns with threading information
+        const threadingHealth = await query(`
+            SELECT 
+                COUNT(*) as total_sent_campaigns,
+                COUNT(CASE WHEN message_id IS NOT NULL THEN 1 END) as campaigns_with_message_id,
+                COUNT(CASE WHEN thread_id IS NOT NULL THEN 1 END) as campaigns_with_thread_id,
+                COUNT(CASE WHEN message_id IS NOT NULL AND thread_id IS NOT NULL THEN 1 END) as fully_threaded_campaigns
+            FROM campaigns 
+            WHERE user_id = $1 AND status = 'sent'
+        `, [req.user.user_id]);
+
+        const followUpHealth = await query(`
+            SELECT 
+                COUNT(*) as total_follow_ups,
+                COUNT(CASE WHEN in_reply_to IS NOT NULL THEN 1 END) as follow_ups_with_reply_to,
+                COUNT(CASE WHEN references IS NOT NULL THEN 1 END) as follow_ups_with_references
+            FROM campaign_followups cf
+            JOIN campaigns c ON cf.campaign_id = c.id
+            WHERE c.user_id = $1
+        `, [req.user.user_id]);
+
+        const stats = threadingHealth.rows[0];
+        const followUpStats = followUpHealth.rows[0];
+
+        const threadingRate = stats.total_sent_campaigns > 0 ? 
+            ((stats.fully_threaded_campaigns / stats.total_sent_campaigns) * 100).toFixed(1) : 0;
+
+        const followUpThreadingRate = followUpStats.total_follow_ups > 0 ? 
+            ((followUpStats.follow_ups_with_reply_to / followUpStats.total_follow_ups) * 100).toFixed(1) : 0;
+
+        res.json({
+            success: true,
+            threadingHealth: {
+                totalSentCampaigns: parseInt(stats.total_sent_campaigns),
+                campaignsWithMessageId: parseInt(stats.campaigns_with_message_id),
+                campaignsWithThreadId: parseInt(stats.campaigns_with_thread_id),
+                fullyThreadedCampaigns: parseInt(stats.fully_threaded_campaigns),
+                threadingRate: parseFloat(threadingRate),
+                totalFollowUps: parseInt(followUpStats.total_follow_ups),
+                followUpsWithReplyTo: parseInt(followUpStats.follow_ups_with_reply_to),
+                followUpsWithReferences: parseInt(followUpStats.follow_ups_with_references),
+                followUpThreadingRate: parseFloat(followUpThreadingRate)
+            }
+        });
+    } catch (error) {
+        console.error('Error getting threading health:', error);
+        res.status(500).json({ error: 'Failed to get threading health information' });
+    }
+});
+
+// 🔥 NEW: Get full email thread for a campaign
+app.get('/api/threading/thread/:campaignId', authenticateToken, async (req, res) => {
+    try {
+        const { campaignId } = req.params;
+        const { campaignRepository } = await import('./repositories/campaignRepository.js');
+        
+        const emailThread = await campaignRepository.getEmailThread(campaignId, req.user.user_id);
+        
+        if (!emailThread) {
+            return res.status(404).json({ error: 'Campaign not found' });
+        }
+
+        res.json({
+            success: true,
+            thread: emailThread
+        });
+    } catch (error) {
+        console.error('Error getting email thread:', error);
+        res.status(500).json({ error: 'Failed to get email thread' });
+    }
+});
+
+// 🔥 NEW: Validate threading integrity for user's campaigns
+app.get('/api/threading/validate', authenticateToken, async (req, res) => {
+    try {
+        const { query } = await import('./config/database.js');
+        
+        // Find campaigns with potential threading issues
+        const threadingIssues = await query(`
+            SELECT 
+                c.id,
+                c.company_name,
+                c.job_title,
+                c.status,
+                c.message_id,
+                c.thread_id,
+                c.follow_up_count,
+                COUNT(cf.id) as actual_follow_ups
+            FROM campaigns c
+            LEFT JOIN campaign_followups cf ON c.id = cf.campaign_id
+            WHERE c.user_id = $1 AND c.status = 'sent'
+            GROUP BY c.id, c.company_name, c.job_title, c.status, c.message_id, c.thread_id, c.follow_up_count
+            HAVING (
+                (c.message_id IS NULL OR c.thread_id IS NULL) OR
+                (c.follow_up_count != COUNT(cf.id))
+            )
+        `, [req.user.user_id]);
+
+        const orphanedFollowUps = await query(`
+            SELECT cf.id, cf.campaign_id, cf.followup_number
+            FROM campaign_followups cf
+            LEFT JOIN campaigns c ON cf.campaign_id = c.id
+            WHERE cf.user_id = $1 AND c.id IS NULL
+        `, [req.user.user_id]);
+
+        res.json({
+            success: true,
+            validation: {
+                campaignsWithIssues: threadingIssues.rows,
+                orphanedFollowUps: orphanedFollowUps.rows,
+                totalIssues: threadingIssues.rows.length + orphanedFollowUps.rows.length
+            }
+        });
+    } catch (error) {
+        console.error('Error validating threading:', error);
+        res.status(500).json({ error: 'Failed to validate threading integrity' });
+    }
+});
+
+// 🔥 NEW: Gmail threading statistics (if Gmail service is available)
+app.get('/api/threading/gmail-stats', authenticateToken, async (req, res) => {
+    try {
+        const { gmailService } = await import('./services/gmailService.js');
+        
+        const hasPermissions = await gmailService.hasGmailPermissions(req.user.user_id);
+        
+        if (!hasPermissions) {
+            return res.json({
+                success: true,
+                hasGmailAccess: false,
+                message: 'Gmail access not granted'
+            });
+        }
+
+        const threadingStats = await gmailService.getThreadingStats(req.user.user_id);
+        
+        res.json({
+            success: true,
+            hasGmailAccess: true,
+            gmailThreadingStats: threadingStats
+        });
+    } catch (error) {
+        console.error('Error getting Gmail threading stats:', error);
+        res.status(500).json({ error: 'Failed to get Gmail threading statistics' });
+    }
+});
+
 // Health check endpoint
 app.get('/health', async (req, res) => {
     try {
@@ -110,7 +303,12 @@ app.get('/health', async (req, res) => {
             status: 'healthy',
             timestamp: new Date().toISOString(),
             uptime: process.uptime(),
-            environment: process.env.NODE_ENV || 'development'
+            environment: process.env.NODE_ENV || 'development',
+            features: {
+                emailThreading: true,
+                followUpThreading: true,
+                threadingMaintenance: true
+            }
         });
     } catch (error) {
         res.status(500).json({
@@ -121,18 +319,29 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// API status endpoint
+// API status endpoint - UPDATED: Include threading features
 app.get('/api/status', (req, res) => {
     res.json({
         message: 'AI Email Automation API is running',
-        version: '1.0.0',
+        version: '2.0.0', // Updated version with threading support
         timestamp: new Date().toISOString(),
         features: {
             authentication: 'Google OAuth 2.0',
             database: 'PostgreSQL',
             ai: 'Google Gemini',
             email: 'Gmail SMTP',
-            scheduling: 'Cron Jobs'
+            scheduling: 'Cron Jobs',
+            threading: 'RFC-compliant Email Threading', // 🔥 NEW
+            followUpThreading: 'Automated Threaded Follow-ups', // 🔥 NEW
+            threadMaintenance: 'Threading Integrity Monitoring' // 🔥 NEW
+        },
+        threading: {
+            messageIdGeneration: true,
+            inReplyToSupport: true,
+            referencesChaining: true,
+            threadIdTracking: true,
+            gmailThreading: true,
+            automatedMaintenance: true
         }
     });
 });
@@ -190,6 +399,14 @@ app.use((error, req, res, next) => {
         });
     }
 
+    // 🔥 NEW: Threading-specific errors
+    if (error.message && error.message.includes('threading')) {
+        return res.status(400).json({ 
+            error: 'Email threading error',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+
     // Default error response
     res.status(500).json({ 
         error: process.env.NODE_ENV === 'production' 
@@ -198,11 +415,12 @@ app.use((error, req, res, next) => {
     });
 });
 
-// Start automated services
+// Start automated services - UPDATED: Include threading maintenance
 console.log('🤖 Starting automated services...');
 startAutomatedFollowUp();
 startCleanupJob();
 startHealthCheck();
+startThreadingMaintenance(); // 🔥 NEW: Start threading maintenance
 
 // Graceful shutdown
 const gracefulShutdown = async () => {
@@ -235,12 +453,20 @@ app.listen(PORT, () => {
     console.log(`   ${process.env.GOOGLE_CLIENT_ID ? '✅' : '❌'} GOOGLE_CLIENT_ID: Google OAuth client ID`);
     console.log(`   ${process.env.GOOGLE_CLIENT_SECRET ? '✅' : '❌'} GOOGLE_CLIENT_SECRET: Google OAuth secret`);
     console.log(`   ${process.env.JWT_SECRET ? '✅' : '❌'} JWT_SECRET: JWT signing secret`);
+    console.log(`   ${process.env.ENCRYPTION_KEY ? '✅' : '❌'} ENCRYPTION_KEY: Data encryption key`); // 🔥 NEW
     console.log(`\n🎯 Ready to automate job search emails with user authentication!`);
     console.log(`\n📖 API Endpoints:`);
     console.log(`   🔐 Authentication: /auth/*`);
     console.log(`   📧 Email Operations: /api/*`);
     console.log(`   📊 Campaign Management: /api/campaigns/*`);
+    console.log(`   🔗 Threading Operations: /api/threading/*`); // 🔥 NEW
     console.log(`   🏥 Health Check: /health`);
+    console.log(`\n🔗 Threading Features:`); // 🔥 NEW
+    console.log(`   📧 RFC-compliant email threading`);
+    console.log(`   🔄 Automated threaded follow-ups`);
+    console.log(`   📊 Threading health monitoring`);
+    console.log(`   🔧 Threading integrity maintenance`);
+    console.log(`   📈 Gmail threading statistics`);
 });
 
 // Handle shutdown signals
