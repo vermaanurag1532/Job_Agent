@@ -20,7 +20,8 @@ class UserRepository {
     async findByEmail(email) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active, has_email_credentials
+                   created_at, updated_at, last_login, is_active, has_email_credentials,
+                   has_gemini_api_key
             FROM users 
             WHERE email = $1 AND is_active = true
         `;
@@ -32,7 +33,8 @@ class UserRepository {
     async findByGoogleId(googleUserId) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active, has_email_credentials
+                   created_at, updated_at, last_login, is_active, has_email_credentials,
+                   has_gemini_api_key
             FROM users 
             WHERE google_user_id = $1 AND is_active = true
         `;
@@ -44,7 +46,8 @@ class UserRepository {
     async findById(userId) {
         const sql = `
             SELECT user_id, email, google_user_id, full_name, profile_picture, 
-                   created_at, updated_at, last_login, is_active, has_email_credentials
+                   created_at, updated_at, last_login, is_active, has_email_credentials,
+                   has_gemini_api_key
             FROM users 
             WHERE user_id = $1 AND is_active = true
         `;
@@ -67,6 +70,51 @@ class UserRepository {
         if (user && user.email_password) {
             // Decrypt email password before returning
             user.email_password = decryptToken(user.email_password);
+        }
+        
+        return user || null;
+    }
+
+    // Get user with Gemini API credentials
+    async findByIdWithGeminiCredentials(userId) {
+        const sql = `
+            SELECT user_id, email, google_user_id, full_name, profile_picture, 
+                   created_at, updated_at, last_login, is_active, has_gemini_api_key,
+                   gemini_api_key
+            FROM users 
+            WHERE user_id = $1 AND is_active = true
+        `;
+        const result = await query(sql, [userId]);
+        const user = result.rows[0];
+        
+        if (user && user.gemini_api_key) {
+            // Decrypt Gemini API key before returning
+            user.gemini_api_key = decryptToken(user.gemini_api_key);
+        }
+        
+        return user || null;
+    }
+
+    // Get user with all credentials (email + gemini)
+    async findByIdWithAllCredentials(userId) {
+        const sql = `
+            SELECT user_id, email, google_user_id, full_name, profile_picture, 
+                   created_at, updated_at, last_login, is_active, has_email_credentials,
+                   has_gemini_api_key, email_password, gemini_api_key
+            FROM users 
+            WHERE user_id = $1 AND is_active = true
+        `;
+        const result = await query(sql, [userId]);
+        const user = result.rows[0];
+        
+        if (user) {
+            // Decrypt credentials before returning
+            if (user.email_password) {
+                user.email_password = decryptToken(user.email_password);
+            }
+            if (user.gemini_api_key) {
+                user.gemini_api_key = decryptToken(user.gemini_api_key);
+            }
         }
         
         return user || null;
@@ -112,6 +160,21 @@ class UserRepository {
         return result.rows[0];
     }
 
+    // Store user's Gemini API key (encrypted)
+    async updateGeminiApiKey(userId, geminiApiKey) {
+        const sql = `
+            UPDATE users 
+            SET gemini_api_key = $2, 
+                has_gemini_api_key = true
+            WHERE user_id = $1
+            RETURNING user_id, has_gemini_api_key
+        `;
+        
+        const encryptedApiKey = encryptToken(geminiApiKey);
+        const result = await query(sql, [userId, encryptedApiKey]);
+        return result.rows[0];
+    }
+
     // Remove user's email credentials
     async removeEmailCredentials(userId) {
         const sql = `
@@ -120,6 +183,20 @@ class UserRepository {
                 has_email_credentials = false
             WHERE user_id = $1
             RETURNING user_id, has_email_credentials
+        `;
+        
+        const result = await query(sql, [userId]);
+        return result.rows[0];
+    }
+
+    // Remove user's Gemini API key
+    async removeGeminiApiKey(userId) {
+        const sql = `
+            UPDATE users 
+            SET gemini_api_key = NULL, 
+                has_gemini_api_key = false
+            WHERE user_id = $1
+            RETURNING user_id, has_gemini_api_key
         `;
         
         const result = await query(sql, [userId]);
@@ -144,45 +221,14 @@ class UserRepository {
         let user = await this.findByGoogleId(googleUserId);
         
         if (!user) {
-            // If not found by Google ID, try by email
-            user = await this.findByEmail(email);
-            
-            if (user) {
-                // User exists but doesn't have Google ID, update it
-                const updateSql = `
-                    UPDATE users 
-                    SET google_user_id = $1, 
-                        last_login = CURRENT_TIMESTAMP
-                    WHERE user_id = $2
-                    RETURNING user_id, email, google_user_id, full_name, profile_picture, created_at, last_login, has_email_credentials
-                `;
-                
-                const result = await query(updateSql, [googleUserId, user.user_id]);
-                return result.rows[0];
-            } else {
-                // Create new user
-                return await this.createUser({ email, googleUserId, fullName, profilePicture });
-            }
+            // Create new user if not found
+            user = await this.createUser({ email, googleUserId, fullName, profilePicture });
         } else {
-            // User found, update last login
+            // Update last login for existing user
             await this.updateLastLogin(user.user_id);
-            return await this.findById(user.user_id);
         }
-    }
-
-    // Get user statistics
-    async getUserStats(userId) {
-        const sql = `
-            SELECT 
-                COUNT(*) as total_campaigns,
-                COUNT(CASE WHEN status = 'sent' THEN 1 END) as sent_campaigns,
-                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_campaigns,
-                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_campaigns
-            FROM campaigns 
-            WHERE user_id = $1
-        `;
-        const result = await query(sql, [userId]);
-        return result.rows[0];
+        
+        return user;
     }
 }
 

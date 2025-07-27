@@ -1,4 +1,4 @@
-// services/emailService.js (Updated with threading support - FIXED)
+// services/emailService.js (FIXED - Parameter order issue)
 import fs from 'fs';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import puppeteer from 'puppeteer';
@@ -12,24 +12,10 @@ import {
   generateThreadId,
   extractDomain 
 } from '../utils/emailThreading.js';
+import { authService } from './authService.js';
 
 // Load environment variables
 dotenv.config();
-
-// Debug: Check if API key is loaded
-console.log('Gemini API Key loaded:', process.env.GEMINI_API_KEY ? 'Yes' : 'No');
-
-// Initialize Google Generative AI with error handling
-let genAI;
-try {
-    if (!process.env.GEMINI_API_KEY) {
-        throw new Error('GEMINI_API_KEY is not set in environment variables');
-    }
-    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    console.log('Google Generative AI initialized successfully');
-} catch (error) {
-    console.error('Failed to initialize Google Generative AI:', error);
-}
 
 // Circuit breaker for handling API failures
 class CircuitBreaker {
@@ -75,6 +61,7 @@ class CircuitBreaker {
             console.log('Circuit breaker reset - service recovered');
         }
         this.failureCount = 0;
+        this.lastFailureTime = null;
         this.state = 'CLOSED';
     }
 }
@@ -82,11 +69,66 @@ class CircuitBreaker {
 // Create circuit breaker instance
 const aiCircuitBreaker = new CircuitBreaker(3, 120000);
 
-class EmailService {
+// Enhanced AI service with user-based API keys
+class AIService {
     constructor() {
+        this.userGenAIInstances = new Map(); // Cache user-specific Gemini instances
         this.requestCount = 0;
         this.lastRequestTime = 0;
         this.minRequestInterval = 1000;
+    }
+
+    // Get or create Gemini AI instance for a specific user
+    async getGeminiInstance(userId) {
+        try {
+            // Validate userId is actually a number/string that can be an ID
+            if (!userId || (typeof userId !== 'number' && typeof userId !== 'string') || 
+                (typeof userId === 'string' && userId.length > 50)) {
+                console.error('❌ Invalid userId provided to getGeminiInstance:', typeof userId, userId?.length);
+                throw new Error('Invalid user ID provided');
+            }
+
+            console.log(`🔍 Getting Gemini instance for user: ${userId} (type: ${typeof userId})`);
+
+            // Check cache first
+            if (this.userGenAIInstances.has(userId)) {
+                console.log(`✅ Using cached Gemini instance for user ${userId}`);
+                return this.userGenAIInstances.get(userId);
+            }
+
+            // Get user's Gemini API key
+            const user = await authService.getUserWithGeminiCredentials(userId);
+            
+            if (!user || !user.gemini_api_key) {
+                // Fallback to environment variable if user doesn't have API key
+                if (process.env.GEMINI_API_KEY) {
+                    console.log(`🔄 Using fallback Gemini API for user ${userId}`);
+                    const fallbackGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+                    this.userGenAIInstances.set(userId, fallbackGenAI);
+                    return fallbackGenAI;
+                } else {
+                    throw new Error('No Gemini API key available for user or in environment');
+                }
+            }
+
+            // Create instance with user's API key
+            console.log(`✅ Using user's Gemini API for user ${userId}`);
+            const genAI = new GoogleGenerativeAI(user.gemini_api_key);
+            
+            // Cache the instance
+            this.userGenAIInstances.set(userId, genAI);
+            
+            return genAI;
+        } catch (error) {
+            console.error('Failed to get Gemini instance for user:', userId, error);
+            throw error;
+        }
+    }
+
+    // Clear cached instance for a user (useful when API key is updated)
+    clearUserInstance(userId) {
+        this.userGenAIInstances.delete(userId);
+        console.log(`🗑️ Cleared Gemini instance cache for user ${userId}`);
     }
 
     // Rate limiting helper
@@ -130,20 +172,18 @@ class EmailService {
         }
     }
 
-    // Enhanced AI generation with fallback
-    async generateWithAI(prompt, options = {}) {
+    // Generate content using user-specific or fallback Gemini instance
+    async generateContent(userId, prompt, options = {}) {
         return await aiCircuitBreaker.call(async () => {
             return await this.retryWithBackoff(async () => {
-                if (!genAI) {
-                    throw new Error('Google Generative AI not initialized');
-                }
-
+                const genAI = await this.getGeminiInstance(userId);
+                
                 const model = genAI.getGenerativeModel({ 
-                    model: options.model || "gemini-1.5-flash",
+                    model: options.model || 'gemini-1.5-flash',
                     generationConfig: {
                         temperature: options.temperature || 0.7,
-                        topP: options.topP || 0.8,
                         topK: options.topK || 40,
+                        topP: options.topP || 0.95,
                         maxOutputTokens: options.maxOutputTokens || 2048,
                     }
                 });
@@ -155,26 +195,68 @@ class EmailService {
         });
     }
 
-    // Generate fallback email template
-    generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName) {
-        const subject = `Application for ${jobTitle} Position at ${companyInfo.name}`;
-        
-        const body = `Dear ${recipientName || 'Hiring Manager'},
+    // Health check for AI service
+    async healthCheck(userId = null) {
+        try {
+            const testPrompt = "Return only the text: 'API is working'";
+            
+            if (userId) {
+                await this.generateContent(userId, testPrompt);
+            } else if (process.env.GEMINI_API_KEY) {
+                // Test fallback API
+                const fallbackGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+                const model = fallbackGenAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+                const result = await model.generateContent(testPrompt);
+                await result.response;
+            }
+            
+            return { 
+                status: 'healthy', 
+                ai_service: 'operational',
+                circuit_breaker: aiCircuitBreaker.state,
+                request_count: this.requestCount
+            };
+        } catch (error) {
+            return { 
+                status: 'degraded', 
+                ai_service: 'error',
+                circuit_breaker: aiCircuitBreaker.state,
+                error: error.message,
+                request_count: this.requestCount
+            };
+        }
+    }
+}
 
-I am writing to express my strong interest in the ${jobTitle} position at ${companyInfo.name}. As a ${senderInfo.currentTitle} with ${senderInfo.yearsOfExperience} of experience, I believe I would be a valuable addition to your team.
+// Create AI service instance
+const aiService = new AIService();
 
-My technical expertise includes ${senderInfo.keySkills.slice(0, 3).join(', ')}, which aligns well with the requirements for this role. In my current position at ${senderInfo.currentCompany}, I have successfully contributed to various projects that have enhanced my problem-solving abilities and technical skills.
+class EmailService {
+    constructor() {
+        this.requestCount = 0;
+        this.lastRequestTime = 0;
+        this.minRequestInterval = 1000;
+    }
 
-I am particularly drawn to ${companyInfo.name} because of your reputation in the industry and commitment to innovation. I would welcome the opportunity to discuss how my background and enthusiasm can contribute to your team's continued success.
+    // Test email credentials
+    async testEmailCredentials(email, password) {
+        try {
+            const transporter = nodemailer.createTransport({
+                service: 'gmail',
+                auth: {
+                    user: email,
+                    pass: password
+                },
+                timeout: 10000
+            });
 
-I have attached my resume for your review and would be happy to provide any additional information you may need. Thank you for considering my application.
-
-Best regards,
-${senderInfo.fullName}
-${senderInfo.email}
-${senderInfo.phone}`;
-
-        return `Subject: ${subject}\n\n${body}`;
+            await transporter.verify();
+            console.log('✅ Email credentials verified successfully');
+            return true;
+        } catch (error) {
+            console.error('❌ Email credentials test failed:', error);
+            return false;
+        }
     }
 
     // Create email transporter for user's Gmail
@@ -186,13 +268,17 @@ ${senderInfo.phone}`;
                 user: userEmail,
                 pass: userAppPassword
             },
+            timeout: 30000,
+            connectionTimeout: 30000,
+            greetingTimeout: 30000,
+            socketTimeout: 30000,
             tls: {
                 rejectUnauthorized: false
             }
         });
     }
 
-    // Create fallback email transporter (your email)
+    // Create fallback email transporter (environment email)
     createFallbackEmailTransporter() {
         return nodemailer.createTransport({
             service: 'gmail',
@@ -203,9 +289,46 @@ ${senderInfo.phone}`;
         });
     }
 
-    // Extract sender information from resume
-    async extractSenderInfo(resumeText) {
+    // Generate fallback email template
+    generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName) {
+        const subject = `Application for ${jobTitle} Position at ${companyInfo.name}`;
+        
+        // Ensure senderInfo has default values
+        const safeSenderInfo = {
+            fullName: senderInfo?.fullName || "Job Seeker",
+            email: senderInfo?.email || "",
+            phone: senderInfo?.phone || "",
+            currentTitle: senderInfo?.currentTitle || "Software Developer",
+            yearsOfExperience: senderInfo?.yearsOfExperience || "2 years",
+            keySkills: senderInfo?.keySkills || ["Programming", "Problem Solving", "Communication"],
+            currentCompany: senderInfo?.currentCompany || "Previous Company",
+            education: senderInfo?.education || "Bachelor's Degree",
+            location: senderInfo?.location || ""
+        };
+
+        const body = `Dear ${recipientName || 'Hiring Manager'},
+
+I am writing to express my strong interest in the ${jobTitle} position at ${companyInfo.name}. As a ${safeSenderInfo.currentTitle} with ${safeSenderInfo.yearsOfExperience} of experience, I believe I would be a valuable addition to your team.
+
+My technical expertise includes ${safeSenderInfo.keySkills.slice(0, 3).join(', ')}, which aligns well with the requirements for this role. In my current position at ${safeSenderInfo.currentCompany}, I have successfully contributed to various projects that have enhanced my problem-solving abilities and technical skills.
+
+I am particularly drawn to ${companyInfo.name} because of your reputation in the industry and commitment to innovation. I would welcome the opportunity to discuss how my background and enthusiasm can contribute to your team's continued success.
+
+I have attached my resume for your review and would be happy to provide any additional information you may need. Thank you for considering my application.
+
+Best regards,
+${safeSenderInfo.fullName}
+${safeSenderInfo.email}
+${safeSenderInfo.phone}`;
+
+        return `Subject: ${subject}\n\n${body}`;
+    }
+
+    // Extract sender information from resume using user's AI
+    async extractSenderInfo(userId, resumeText) {
         try {
+            console.log(`🔍 Extracting sender info for user: ${userId} (type: ${typeof userId})`);
+            
             const prompt = `
 Extract the following information from this resume text and return it as a JSON object:
 
@@ -239,7 +362,7 @@ Return ONLY a valid JSON object with these fields:
 If any information is not found, use empty string or empty array for that field.
 `;
 
-            const response = await this.generateWithAI(prompt);
+            const response = await aiService.generateContent(userId, prompt);
             
             try {
                 const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -380,9 +503,24 @@ If any information is not found, use empty string or empty array for that field.
         }
     }
 
-    // Generate personalized email using Gemini AI with fallback
-    async generatePersonalizedEmail(companyInfo, resumeText, senderInfo, emailType, jobTitle, recipientName, additionalInfo) {
+    // Generate personalized email using user's Gemini AI with fallback
+    async generatePersonalizedEmail(userId, companyInfo, resumeText, senderInfo, emailType, jobTitle, recipientName, additionalInfo) {
         try {
+            console.log(`🤖 Generating personalized email for user: ${userId} (type: ${typeof userId})`);
+            
+            // Ensure senderInfo has default values to prevent errors
+            const safeSenderInfo = {
+                fullName: senderInfo?.fullName || "Job Seeker",
+                email: senderInfo?.email || "",
+                phone: senderInfo?.phone || "",
+                currentTitle: senderInfo?.currentTitle || "Software Developer",
+                yearsOfExperience: senderInfo?.yearsOfExperience || "2 years",
+                keySkills: senderInfo?.keySkills || ["Programming", "Problem Solving", "Communication"],
+                currentCompany: senderInfo?.currentCompany || "Previous Company",
+                education: senderInfo?.education || "Bachelor's Degree",
+                location: senderInfo?.location || ""
+            };
+
             const prompt = `
 You are writing a professional cold email for a job application. Write a compelling, natural email that reads like a senior developer wrote it personally.
 
@@ -395,10 +533,10 @@ You are writing a professional cold email for a job application. Write a compell
 6. Make every sentence complete and actionable
 
 **SENDER DETAILS:**
-Name: ${senderInfo.fullName}
-Current Role: ${senderInfo.currentTitle} at ${senderInfo.currentCompany}
-Skills: ${senderInfo.keySkills.join(', ')}
-Education: ${senderInfo.education}
+Name: ${safeSenderInfo.fullName}
+Current Role: ${safeSenderInfo.currentTitle} at ${safeSenderInfo.currentCompany}
+Skills: ${safeSenderInfo.keySkills.join(', ')}
+Education: ${safeSenderInfo.education}
 
 **TARGET:**
 Company: ${companyInfo.name}
@@ -444,39 +582,77 @@ Dear ${recipientName || 'Hiring Manager'},
 [Write natural, impressive email body]
 
 Best regards,
-${senderInfo.fullName}
-${senderInfo.email}  
-${senderInfo.phone}
+${safeSenderInfo.fullName}
+${safeSenderInfo.email}  
+${safeSenderInfo.phone}
 
 REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natural sentences.
 `;
 
             try {
-                const aiResponse = await this.generateWithAI(prompt);
-                console.log('✅ Email generated successfully with AI');
+                const aiResponse = await aiService.generateContent(userId, prompt);
+                console.log('✅ Email generated successfully with user AI');
                 return aiResponse;
             } catch (aiError) {
-                console.error('AI generation failed:', aiError.message);
+                console.error('User AI generation failed:', aiError.message);
+                
+                // If user's API key fails, try fallback
+                if (aiError.message && aiError.message.includes('API_KEY_INVALID') && process.env.GEMINI_API_KEY) {
+                    console.log('🔄 User API key invalid, trying fallback...');
+                    aiService.clearUserInstance(userId);
+                    
+                    try {
+                        const fallbackResponse = await aiService.generateContent(userId, prompt);
+                        console.log('✅ Email generated with fallback AI');
+                        return fallbackResponse;
+                    } catch (fallbackError) {
+                        console.error('Fallback AI also failed:', fallbackError.message);
+                    }
+                }
                 
                 console.log('📝 Using fallback email template...');
-                const fallbackEmail = this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
+                const fallbackEmail = this.generateFallbackEmail(companyInfo, safeSenderInfo, jobTitle, recipientName);
                 return fallbackEmail;
             }
         } catch (error) {
             console.error('Error in generatePersonalizedEmail:', error);
             
-            return this.generateFallbackEmail(companyInfo, senderInfo, jobTitle, recipientName);
+            // Ensure we have safe sender info for fallback
+            const safeSenderInfo = {
+                fullName: senderInfo?.fullName || "Job Seeker",
+                email: senderInfo?.email || "",
+                phone: senderInfo?.phone || "",
+                currentTitle: senderInfo?.currentTitle || "Software Developer",
+                yearsOfExperience: senderInfo?.yearsOfExperience || "2 years",
+                keySkills: senderInfo?.keySkills || ["Programming", "Problem Solving", "Communication"],
+                currentCompany: senderInfo?.currentCompany || "Previous Company",
+                education: senderInfo?.education || "Bachelor's Degree",
+                location: senderInfo?.location || ""
+            };
+            
+            return this.generateFallbackEmail(companyInfo, safeSenderInfo, jobTitle, recipientName);
         }
     }
 
-    // 🔥 UPDATED: Send email function with threading support
+    // Send email function with threading support and user's email credentials
     async sendEmail(recipientEmail, subject, body, senderInfo, resumePath, userId, userEmailCredentials = null, threadingOptions = {}) {
         try {
             let transporter;
             let fromEmail;
             let method;
 
-            // Try to use user's email credentials if provided
+            // Get user's email credentials from database if not provided
+            if (!userEmailCredentials) {
+                const user = await authService.getUserWithEmailCredentials(userId);
+                if (user && user.email_password) {
+                    userEmailCredentials = {
+                        email: user.email,
+                        appPassword: user.email_password
+                    };
+                }
+            }
+
+            // Try to use user's email credentials if available
             if (userEmailCredentials && userEmailCredentials.email && userEmailCredentials.appPassword) {
                 console.log(`🔄 Attempting to send email via user's Gmail: ${userEmailCredentials.email}`);
                 transporter = this.createUserEmailTransporter(userEmailCredentials.email, userEmailCredentials.appPassword);
@@ -489,7 +665,7 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
                 method = 'fallback_smtp';
             }
 
-            // 🔥 UPDATED: Generate threading headers with emailReferences
+            // Generate threading headers with emailReferences
             const threadHeaders = createThreadingHeaders({
                 senderEmail: senderInfo.email || fromEmail,
                 originalMessageId: threadingOptions.originalMessageId || null,
@@ -507,7 +683,7 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
                 text: body,
                 html: body.replace(/\n/g, '<br>'),
                 replyTo: senderInfo.email,
-                // 🔥 NEW: Add threading headers
+                // Add threading headers
                 headers: {
                     ...threadHeaders,
                     'X-Campaign-Type': threadingOptions.campaignType || 'original',
@@ -559,8 +735,8 @@ REMEMBER: Zero placeholders, zero brackets, zero examples - only complete, natur
         }
     }
 
-    // 🔥 UPDATED: Generate follow-up email with proper threading
-    async generateFollowUpEmail(originalEmail, companyName, jobTitle, senderInfo, followUpNumber, originalSubject = null) {
+    // Generate follow-up email with proper threading using user's AI
+    async generateFollowUpEmail(userId, originalEmail, companyName, jobTitle, senderInfo, followUpNumber, originalSubject = null) {
         try {
             // Extract original subject if not provided
             let extractedSubject = originalSubject;
@@ -611,11 +787,11 @@ ${senderInfo.phone}
 `;
 
             try {
-                const aiResponse = await this.generateWithAI(prompt);
-                console.log('✅ Follow-up email generated successfully with AI');
+                const aiResponse = await aiService.generateContent(userId, prompt);
+                console.log('✅ Follow-up email generated successfully with user AI');
                 return aiResponse;
             } catch (aiError) {
-                console.error('AI generation failed for follow-up:', aiError.message);
+                console.error('User AI generation failed for follow-up:', aiError.message);
                 
                 // Fallback follow-up template with proper subject formatting
                 const replySubject = formatFollowUpSubject(extractedSubject || `${jobTitle} Application`, followUpNumber);
@@ -643,24 +819,31 @@ ${senderInfo.phone}`;
         }
     }
 
+    // Clear user's AI instance cache when API key is updated
+    clearUserAICache(userId) {
+        aiService.clearUserInstance(userId);
+        console.log(`🗑️ Cleared AI cache for user ${userId}`);
+    }
+
     // Health check method
-    async healthCheck() {
+    async healthCheck(userId = null) {
+        return await aiService.healthCheck(userId);
+    }
+
+    // Test user's Gemini API key
+    async testUserGeminiAPI(userId) {
         try {
-            const testPrompt = "Return only the text: 'API is working'";
-            const response = await this.generateWithAI(testPrompt);
+            const testPrompt = "Return only the text: 'User API is working'";
+            const response = await aiService.generateContent(userId, testPrompt);
             return { 
-                status: 'healthy', 
-                ai_service: 'operational',
-                circuit_breaker: aiCircuitBreaker.state,
-                request_count: this.requestCount
+                success: true, 
+                message: 'User Gemini API is working',
+                response: response
             };
         } catch (error) {
             return { 
-                status: 'degraded', 
-                ai_service: 'error',
-                circuit_breaker: aiCircuitBreaker.state,
-                error: error.message,
-                request_count: this.requestCount
+                success: false, 
+                error: error.message 
             };
         }
     }

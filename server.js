@@ -454,19 +454,6 @@ app.listen(PORT, () => {
     console.log(`   ${process.env.GOOGLE_CLIENT_SECRET ? '✅' : '❌'} GOOGLE_CLIENT_SECRET: Google OAuth secret`);
     console.log(`   ${process.env.JWT_SECRET ? '✅' : '❌'} JWT_SECRET: JWT signing secret`);
     console.log(`   ${process.env.ENCRYPTION_KEY ? '✅' : '❌'} ENCRYPTION_KEY: Data encryption key`); // 🔥 NEW
-    console.log(`\n🎯 Ready to automate job search emails with user authentication!`);
-    console.log(`\n📖 API Endpoints:`);
-    console.log(`   🔐 Authentication: /auth/*`);
-    console.log(`   📧 Email Operations: /api/*`);
-    console.log(`   📊 Campaign Management: /api/campaigns/*`);
-    console.log(`   🔗 Threading Operations: /api/threading/*`); // 🔥 NEW
-    console.log(`   🏥 Health Check: /health`);
-    console.log(`\n🔗 Threading Features:`); // 🔥 NEW
-    console.log(`   📧 RFC-compliant email threading`);
-    console.log(`   🔄 Automated threaded follow-ups`);
-    console.log(`   📊 Threading health monitoring`);
-    console.log(`   🔧 Threading integrity maintenance`);
-    console.log(`   📈 Gmail threading statistics`);
 });
 
 // Handle shutdown signals

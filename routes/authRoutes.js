@@ -1,134 +1,129 @@
 import express from 'express';
-import passport from '../config/passport.js';
+import passport from 'passport';
+import jwt from 'jsonwebtoken';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { authenticateToken } from '../middleware/authMiddleware.js';
 import { authService } from '../services/authService.js';
-import { authenticateToken, rateLimit } from '../middleware/authMiddleware.js';
+import { emailService } from '../services/emailService.js';
 
 const router = express.Router();
 
-// Apply rate limiting to auth routes
-router.use(rateLimit(15 * 60 * 1000, 50)); // 50 requests per 15 minutes
-
-// Simple Google OAuth Routes (just for basic profile)
-router.get('/google', 
+// Google OAuth routes
+router.get('/google', (req, res, next) => {
+    console.log('🔐 Starting Google OAuth flow...');
     passport.authenticate('google', { 
-        scope: ['profile', 'email']
-    })
-);
+        scope: ['profile', 'email'],
+        prompt: 'select_account'
+    })(req, res, next);
+});
 
-router.get('/google/callback',
-    passport.authenticate('google', { 
-        failureRedirect: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=auth_failed`
-    }),
-    async (req, res) => {
+router.get('/google/callback', (req, res, next) => {
+    console.log('📥 Received Google OAuth callback');
+    
+    passport.authenticate('google', { session: false }, async (err, user, info) => {
         try {
-            console.log('🔍 Auth callback - req.user:', req.user);
-            
-            if (!req.user) {
-                throw new Error('No user data received from Google');
+            if (err) {
+                console.error('❌ OAuth error:', err);
+                return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=oauth_error`);
             }
-
-            const token = authService.generateToken(req.user);
             
-            console.log('✅ Token generated for user:', {
-                userId: req.user.user_id,
-                email: req.user.email,
-                tokenGenerated: !!token
-            });
+            if (!user) {
+                console.error('❌ No user returned from OAuth:', info);
+                return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=oauth_failed`);
+            }
             
-            // Set token in HTTP-only cookie
-            res.cookie('auth_token', token, {
+            console.log('✅ OAuth successful for user:', user.email);
+            
+            // Generate JWT token
+            const token = jwt.sign(
+                { 
+                    user_id: user.user_id,
+                    email: user.email 
+                },
+                process.env.JWT_SECRET,
+                { expiresIn: '7d' }
+            );
+            
+            // Set HTTP-only cookie
+            res.cookie('token', token, {
                 httpOnly: true,
                 secure: true,
                 sameSite: 'none',
-                maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-                domain: undefined
+                maxAge: 7 * 24 * 60 * 60 * 1000,
+                domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
             });
-
-            // Redirect to frontend
-            const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/?auth=success`;
-            console.log('🔄 Redirecting to:', redirectUrl);
-            res.redirect(redirectUrl);
+            
+            console.log('🍪 Token cookie set successfully');
+            
+            // Redirect to frontend with success
+            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?auth=success`);
+            
         } catch (error) {
-            console.error('Google callback error:', error);
-            const errorUrl = `${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=callback_failed&message=${encodeURIComponent(error.message)}`;
-            res.redirect(errorUrl);
+            console.error('❌ OAuth callback error:', error);
+            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=server_error`);
         }
-    }
-);
+    })(req, res, next);
+});
 
-// Store user's email credentials
-router.post('/email-credentials', authenticateToken, async (req, res) => {
+// Check authentication status
+router.get('/status', authenticateToken, async (req, res) => {
     try {
-        const { emailPassword } = req.body;
+        const userInfo = {
+            authenticated: true,
+            user: {
+                id: req.user.user_id,
+                email: req.user.email,
+                fullName: req.user.full_name,
+                profilePicture: req.user.profile_picture,
+                createdAt: req.user.created_at,
+                lastLogin: req.user.last_login,
+                hasEmailCredentials: req.user.has_email_credentials,
+                hasGeminiApiKey: req.user.has_gemini_api_key
+            }
+        };
         
-        if (!emailPassword) {
-            return res.status(400).json({ error: 'Email app password is required' });
-        }
-
-        const { userRepository } = await import('../repositories/userRepository.js');
-        await userRepository.updateEmailCredentials(req.user.user_id, emailPassword);
-        
-        res.json({ 
-            success: true,
-            message: 'Email credentials saved successfully',
-            hasEmailCredentials: true
-        });
+        console.log('✅ Auth status check successful for:', req.user.email);
+        res.json(userInfo);
     } catch (error) {
-        console.error('Store email credentials error:', error);
-        res.status(500).json({ error: 'Failed to store email credentials' });
+        console.error('Auth status error:', error);
+        res.status(500).json({ 
+            authenticated: false, 
+            error: 'Failed to get auth status' 
+        });
     }
 });
 
-// Remove user's email credentials
-router.delete('/email-credentials', authenticateToken, async (req, res) => {
-    try {
-        const { userRepository } = await import('../repositories/userRepository.js');
-        await userRepository.removeEmailCredentials(req.user.user_id);
-        
-        res.json({ 
-            success: true,
-            message: 'Email credentials removed successfully',
-            hasEmailCredentials: false
-        });
-    } catch (error) {
-        console.error('Remove email credentials error:', error);
-        res.status(500).json({ error: 'Failed to remove email credentials' });
-    }
-});
-
-// Test user's email credentials
+// Test email credentials
 router.post('/test-email-credentials', authenticateToken, async (req, res) => {
     try {
         const { emailPassword } = req.body;
         
         if (!emailPassword) {
-            return res.status(400).json({ error: 'Email app password is required' });
-        }
-
-        console.log(`🧪 Testing email credentials for user: ${req.user.email}`);
-        
-        // Import email service dynamically
-        const { emailService } = await import('../services/emailService.js');
-        
-        // Create a test transporter
-        const testTransporter = emailService.createUserEmailTransporter(req.user.email, emailPassword);
-        
-        // Test the connection
-        await testTransporter.verify();
-        
-        console.log(`✅ Email credentials test successful for: ${req.user.email}`);
-        
-        res.json({ 
-            success: true,
-            message: 'Email credentials are valid',
-            email: req.user.email
-        });
-    } catch (error) {
-        console.error('❌ Test email credentials error:', error);
-        
-        if (error.code === 'EAUTH') {
             return res.status(400).json({ 
-                error: 'Invalid email credentials. Please check your app password.',
+                error: 'Email password is required' 
+            });
+        }
+        
+        // Test the credentials with the user's email
+        const isValid = await emailService.testEmailCredentials(req.user.email, emailPassword);
+        
+        if (isValid) {
+            res.json({ 
+                success: true, 
+                message: 'Email credentials are valid' 
+            });
+        } else {
+            res.status(400).json({ 
+                error: 'Invalid email credentials' 
+            });
+        }
+        
+    } catch (error) {
+        console.error('Test email credentials error:', error);
+        
+        if (error.message && error.message.includes('Invalid login')) {
+            return res.status(400).json({ 
+                error: 'Gmail app password is incorrect. Please check your app password.',
                 code: 'INVALID_CREDENTIALS'
             });
         }
@@ -147,6 +142,129 @@ router.post('/test-email-credentials', authenticateToken, async (req, res) => {
     }
 });
 
+// Save email credentials
+router.post('/save-email-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { emailPassword } = req.body;
+        
+        if (!emailPassword) {
+            return res.status(400).json({ 
+                error: 'Email password is required' 
+            });
+        }
+        
+        // Save the encrypted credentials
+        const result = await authService.saveEmailCredentials(req.user.user_id, emailPassword);
+        
+        res.json({ 
+            success: true, 
+            hasEmailCredentials: result.has_email_credentials,
+            message: 'Email credentials saved successfully' 
+        });
+        
+    } catch (error) {
+        console.error('Save email credentials error:', error);
+        res.status(500).json({ 
+            error: 'Failed to save email credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// Test Gemini API credentials
+router.post('/test-gemini-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { geminiApiKey } = req.body;
+        
+        if (!geminiApiKey) {
+            return res.status(400).json({ 
+                error: 'Gemini API key is required' 
+            });
+        }
+        
+        // Test the Gemini API key
+        try {
+            const genAI = new GoogleGenerativeAI(geminiApiKey);
+            const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+            
+            // Test with a simple prompt
+            const result = await model.generateContent('Test message. Please respond with "API key is working"');
+            const response = await result.response;
+            const text = response.text();
+            
+            if (text && text.length > 0) {
+                res.json({ 
+                    success: true, 
+                    message: 'Gemini API key is valid',
+                    testResponse: text
+                });
+            } else {
+                res.status(400).json({ 
+                    error: 'Invalid Gemini API key - no response received' 
+                });
+            }
+            
+        } catch (apiError) {
+            console.error('Gemini API test error:', apiError);
+            
+            if (apiError.message && apiError.message.includes('API_KEY_INVALID')) {
+                return res.status(400).json({ 
+                    error: 'Invalid Gemini API key. Please check your API key.',
+                    code: 'INVALID_API_KEY'
+                });
+            }
+            
+            if (apiError.message && apiError.message.includes('quota')) {
+                return res.status(400).json({ 
+                    error: 'Gemini API quota exceeded. Please check your billing.',
+                    code: 'QUOTA_EXCEEDED'
+                });
+            }
+            
+            return res.status(400).json({ 
+                error: 'Failed to validate Gemini API key',
+                details: process.env.NODE_ENV === 'development' ? apiError.message : undefined
+            });
+        }
+        
+    } catch (error) {
+        console.error('Test Gemini credentials error:', error);
+        res.status(500).json({ 
+            error: 'Failed to test Gemini credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// Save Gemini API credentials
+router.post('/save-gemini-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { geminiApiKey } = req.body;
+        
+        if (!geminiApiKey) {
+            return res.status(400).json({ 
+                error: 'Gemini API key is required' 
+            });
+        }
+        
+        // Save the encrypted API key
+        const result = await authService.saveGeminiCredentials(req.user.user_id, geminiApiKey);
+        
+        res.json({ 
+            success: true, 
+            hasGeminiApiKey: result.has_gemini_api_key,
+            message: 'Gemini API key saved successfully' 
+        });
+        
+    } catch (error) {
+        console.error('Save Gemini credentials error:', error);
+        res.status(500).json({ 
+            error: 'Failed to save Gemini credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
 // Get current user info
 router.get('/me', authenticateToken, async (req, res) => {
     try {
@@ -158,7 +276,8 @@ router.get('/me', authenticateToken, async (req, res) => {
                 profilePicture: req.user.profile_picture,
                 createdAt: req.user.created_at,
                 lastLogin: req.user.last_login,
-                hasEmailCredentials: req.user.has_email_credentials
+                hasEmailCredentials: req.user.has_email_credentials,
+                hasGeminiApiKey: req.user.has_gemini_api_key
             },
             stats: await authService.getUserStats(req.user.user_id)
         };
@@ -187,6 +306,82 @@ router.get('/email-status', authenticateToken, async (req, res) => {
     }
 });
 
+// Get Gemini API status
+router.get('/gemini-status', authenticateToken, async (req, res) => {
+    try {
+        const { userRepository } = await import('../repositories/userRepository.js');
+        const user = await userRepository.findById(req.user.user_id);
+        
+        res.json({
+            hasGeminiApiKey: user.has_gemini_api_key,
+            canUseAI: user.has_gemini_api_key
+        });
+    } catch (error) {
+        console.error('Gemini status check error:', error);
+        res.status(500).json({ error: 'Failed to check Gemini status' });
+    }
+});
+
+// Get credentials status (combined)
+router.get('/credentials-status', authenticateToken, async (req, res) => {
+    try {
+        const { userRepository } = await import('../repositories/userRepository.js');
+        const user = await userRepository.findById(req.user.user_id);
+        
+        res.json({
+            hasEmailCredentials: user.has_email_credentials,
+            hasGeminiApiKey: user.has_gemini_api_key,
+            email: user.email,
+            canSendEmails: user.has_email_credentials,
+            canUseAI: user.has_gemini_api_key,
+            isFullySetup: user.has_email_credentials && user.has_gemini_api_key
+        });
+    } catch (error) {
+        console.error('Credentials status check error:', error);
+        res.status(500).json({ error: 'Failed to check credentials status' });
+    }
+});
+
+// Remove email credentials
+router.delete('/email-credentials', authenticateToken, async (req, res) => {
+    try {
+        const result = await authService.removeEmailCredentials(req.user.user_id);
+        
+        res.json({ 
+            success: true, 
+            hasEmailCredentials: result.has_email_credentials,
+            message: 'Email credentials removed successfully' 
+        });
+        
+    } catch (error) {
+        console.error('Remove email credentials error:', error);
+        res.status(500).json({ 
+            error: 'Failed to remove email credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// Remove Gemini API credentials
+router.delete('/gemini-credentials', authenticateToken, async (req, res) => {
+    try {
+        const result = await authService.removeGeminiCredentials(req.user.user_id);
+        
+        res.json({ 
+            success: true, 
+            hasGeminiApiKey: result.has_gemini_api_key,
+            message: 'Gemini API key removed successfully' 
+        });
+        
+    } catch (error) {
+        console.error('Remove Gemini credentials error:', error);
+        res.status(500).json({ 
+            error: 'Failed to remove Gemini credentials',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
 // Logout
 router.post('/logout', authenticateToken, async (req, res) => {
     try {
@@ -197,172 +392,60 @@ router.post('/logout', authenticateToken, async (req, res) => {
             httpOnly: true,
             secure: true,
             sameSite: 'none',
-            domain: undefined,
-            path: '/'
+            domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
         };
         
-        // Clear the JWT auth token cookie
-        res.clearCookie('auth_token', cookieOptions);
-        
-        // Clear session cookie (if it exists)
+        res.clearCookie('token', cookieOptions);
         res.clearCookie('connect.sid', cookieOptions);
         
-        // Destroy the session completely
-        if (req.session) {
-            req.session.destroy((err) => {
-                if (err) {
-                    console.error('Session destruction error:', err);
-                }
-            });
-        }
-        
-        // Logout from Passport session
-        if (req.logout) {
-            req.logout((err) => {
-                if (err) {
-                    console.error('Passport logout error:', err);
-                }
-            });
-        }
-
-        // Send response with additional headers to ensure cleanup
-        res.set({
-            'Clear-Site-Data': '"cookies", "storage"',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0'
-        });
-
+        console.log('👋 User logged out successfully');
         res.json({ 
             success: true, 
             message: 'Logged out successfully' 
         });
+        
     } catch (error) {
         console.error('Logout error:', error);
         res.status(500).json({ error: 'Failed to logout' });
     }
 });
 
-// Refresh token
-router.post('/refresh', async (req, res) => {
+// Delete account
+router.delete('/account', authenticateToken, async (req, res) => {
     try {
-        const oldToken = req.cookies.auth_token || req.body.token;
+        const result = await authService.deleteAccount(req.user.user_id);
         
-        if (!oldToken) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const result = await authService.refreshToken(oldToken);
-        
-        // Set new token in cookie
-        res.cookie('auth_token', result.token, {
-            httpOnly: true,
-            secure: true,
-            sameSite: 'none',
-            maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-            domain: undefined
-        });
-
-        res.json({ 
-            success: true, 
-            token: result.token 
-        });
-    } catch (error) {
-        console.error('Token refresh error:', error);
-        res.status(401).json({ error: 'Failed to refresh token' });
-    }
-});
-
-// Check authentication status
-// Check authentication status - FIXED
-router.get('/status', async (req, res) => {
-    try {
-        const token = req.cookies.auth_token || req.headers.authorization?.split(' ')[1];
-        
-        if (!token) {
-            // Also check if there's a session but no token - clean it up
-            if (req.session) {
-                req.session.destroy((err) => {
-                    if (err) console.error('Session cleanup error:', err);
-                });
-            }
-            return res.json({ authenticated: false });
-        }
-
-        const decoded = authService.verifyToken(token);
-        
-        const { userRepository } = await import('../repositories/userRepository.js');
-        const user = await userRepository.findById(decoded.userId);
-        
-        if (!user || !user.is_active) {
-            // User not found or inactive - clean up session and cookies
-            if (req.session) {
-                req.session.destroy((err) => {
-                    if (err) console.error('Session cleanup error:', err);
-                });
-            }
-            
-            res.clearCookie('auth_token', {
+        if (result.success) {
+            // Clear cookies
+            const cookieOptions = {
                 httpOnly: true,
                 secure: true,
                 sameSite: 'none',
-                domain: undefined,
-                path: '/'
-            });
+                domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
+            };
             
-            return res.json({ authenticated: false });
-        }
-        
-        res.json({ 
-            authenticated: true,
-            user: {
-                id: user.user_id,
-                email: user.email,
-                name: user.full_name,
-                picture: user.profile_picture,
-                createdAt: user.created_at,
-                lastLogin: user.last_login,
-                hasEmailCredentials: user.has_email_credentials
-            }
-        });
-    } catch (error) {
-        console.error('❌ Status check error:', error);
-        
-        // Clean up on any error
-        if (req.session) {
-            req.session.destroy((err) => {
-                if (err) console.error('Session cleanup error:', err);
+            res.clearCookie('token', cookieOptions);
+            res.clearCookie('connect.sid', cookieOptions);
+            
+            console.log('🗑️ Account deleted successfully for user:', req.user.email);
+            res.json({ 
+                success: true, 
+                message: 'Account deleted successfully' 
+            });
+        } else {
+            res.status(500).json({ 
+                error: 'Failed to delete account',
+                details: result.error
             });
         }
         
-        res.clearCookie('auth_token', {
-            httpOnly: true,
-            secure: true,
-            sameSite: 'none',
-            domain: undefined,
-            path: '/'
-        });
-        
-        return res.json({ authenticated: false });
-    }
-});
-
-// Delete account (soft delete)
-router.delete('/account', authenticateToken, async (req, res) => {
-    try {
-        const { userRepository } = await import('../repositories/userRepository.js');
-        await userRepository.deactivateUser(req.user.user_id);
-        
-        res.clearCookie('auth_token');
-        res.json({ 
-            success: true, 
-            message: 'Account deactivated successfully' 
-        });
     } catch (error) {
-        console.error('Account deletion error:', error);
-        res.status(500).json({ error: 'Failed to delete account' });
+        console.error('Delete account error:', error);
+        res.status(500).json({ 
+            error: 'Failed to delete account',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
     }
 });
 
-// Export as default
 export default router;

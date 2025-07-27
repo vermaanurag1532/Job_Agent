@@ -1,137 +1,103 @@
-import jwt from 'jsonwebtoken';
 import { userRepository } from '../repositories/userRepository.js';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { query } from '../config/database.js';
 
 class AuthService {
-    // Generate JWT token
-    generateToken(user) {
-        const payload = {
-            userId: user.user_id,
-            email: user.email,
-            fullName: user.full_name
-        };
-
-        return jwt.sign(payload, process.env.JWT_SECRET, {
-            expiresIn: process.env.JWT_EXPIRES_IN || '7d'
-        });
-    }
-
-    // Verify JWT token
-    verifyToken(token) {
+    // Handle OAuth user creation/update
+    async handleOAuthUser(profile) {
         try {
-            return jwt.verify(token, process.env.JWT_SECRET);
-        } catch (error) {
-            throw new Error('Invalid or expired token');
-        }
-    }
-
-    // Handle Google OAuth callback (legacy method - not used in current flow)
-    async handleGoogleCallback(profile) {
-        try {
-            console.log('🔍 Profile data received:', {
-                id: profile.id,
-                displayName: profile.displayName,
-                emails: profile.emails,
-                photos: profile.photos
-            });
-
-            // Safely extract email
-            const email = profile.emails && profile.emails.length > 0 
-                ? profile.emails[0].value 
-                : null;
-
-            if (!email) {
-                throw new Error('No email found in Google profile');
-            }
-
-            // Safely extract profile picture
-            const profilePicture = profile.photos && profile.photos.length > 0 
-                ? profile.photos[0].value 
-                : null;
-
             const userData = {
-                email: email,
+                email: profile.emails[0].value,
                 googleUserId: profile.id,
-                fullName: profile.displayName || 'Google User',
-                profilePicture: profilePicture
+                fullName: profile.displayName,
+                profilePicture: profile.photos?.[0]?.value || null
             };
-
-            console.log('✅ Extracted user data:', userData);
-
+            
             const user = await userRepository.findOrCreateUser(userData);
-            const token = this.generateToken(user);
-
-            return {
-                user: {
-                    id: user.user_id,
-                    email: user.email,
-                    fullName: user.full_name,
-                    profilePicture: user.profile_picture,
-                    createdAt: user.created_at,
-                    lastLogin: user.last_login
-                },
-                token
-            };
+            return user;
         } catch (error) {
-            console.error('Error in Google callback:', error);
+            console.error('Error handling OAuth user:', error);
             throw error;
         }
     }
 
-    // Get current user info
-    async getCurrentUser(userId) {
+    // Save email credentials
+    async saveEmailCredentials(userId, emailPassword) {
         try {
-            const user = await userRepository.findById(userId);
-            if (!user) {
-                throw new Error('User not found');
-            }
-
-            const stats = await userRepository.getUserStats(userId);
-
-            return {
-                user: {
-                    id: user.user_id,
-                    email: user.email,
-                    fullName: user.full_name,
-                    profilePicture: user.profile_picture,
-                    createdAt: user.created_at,
-                    lastLogin: user.last_login
-                },
-                stats
-            };
+            return await userRepository.updateEmailCredentials(userId, emailPassword);
         } catch (error) {
-            console.error('Error getting current user:', error);
+            console.error('Error saving email credentials:', error);
             throw error;
         }
     }
 
-    // Get user statistics
+    // Save Gemini API credentials
+    async saveGeminiCredentials(userId, geminiApiKey) {
+        try {
+            return await userRepository.updateGeminiApiKey(userId, geminiApiKey);
+        } catch (error) {
+            console.error('Error saving Gemini credentials:', error);
+            throw error;
+        }
+    }
+
+    // Remove email credentials
+    async removeEmailCredentials(userId) {
+        try {
+            return await userRepository.removeEmailCredentials(userId);
+        } catch (error) {
+            console.error('Error removing email credentials:', error);
+            throw error;
+        }
+    }
+
+    // Remove Gemini API credentials
+    async removeGeminiCredentials(userId) {
+        try {
+            return await userRepository.removeGeminiApiKey(userId);
+        } catch (error) {
+            console.error('Error removing Gemini credentials:', error);
+            throw error;
+        }
+    }
+
+    // Get user stats
     async getUserStats(userId) {
         try {
-            const stats = await userRepository.getUserStats(userId);
-            return stats;
+            const statsQuery = `
+                SELECT 
+                    COUNT(*) as total_campaigns,
+                    COUNT(CASE WHEN status = 'sent' THEN 1 END) as sent_campaigns,
+                    COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_campaigns,
+                    COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_campaigns,
+                    SUM(follow_up_count) as total_followups
+                FROM campaigns 
+                WHERE user_id = $1
+            `;
+            
+            const result = await query(statsQuery, [userId]);
+            return result.rows[0] || {
+                total_campaigns: 0,
+                sent_campaigns: 0,
+                pending_campaigns: 0,
+                failed_campaigns: 0,
+                total_followups: 0
+            };
         } catch (error) {
             console.error('Error getting user stats:', error);
             return {
                 total_campaigns: 0,
                 sent_campaigns: 0,
+                pending_campaigns: 0,
                 failed_campaigns: 0,
-                pending_campaigns: 0
+                total_followups: 0
             };
         }
     }
 
-    // Logout user (token blacklisting would be implemented here if needed)
+    // Logout user
     async logout(userId) {
         try {
-            // In a more robust implementation, you might want to:
-            // 1. Add token to blacklist
-            // 2. Clear session from database
-            // 3. Log the logout event
-            
-            console.log(`User ${userId} logged out`);
+            await userRepository.updateLastLogin(userId);
             return { success: true };
         } catch (error) {
             console.error('Error during logout:', error);
@@ -139,20 +105,60 @@ class AuthService {
         }
     }
 
-    // Refresh token
-    async refreshToken(oldToken) {
+    // Delete user account
+    async deleteAccount(userId) {
         try {
-            const decoded = this.verifyToken(oldToken);
-            const user = await userRepository.findById(decoded.userId);
+            // First get all campaigns to clean up files
+            const campaignsQuery = 'SELECT resume_path FROM campaigns WHERE user_id = $1 AND resume_path IS NOT NULL';
+            const campaigns = await query(campaignsQuery, [userId]);
             
-            if (!user) {
-                throw new Error('User not found');
+            // Clean up resume files (optional - implement if needed)
+            // for (const campaign of campaigns.rows) {
+            //     if (campaign.resume_path && fs.existsSync(campaign.resume_path)) {
+            //         fs.unlinkSync(campaign.resume_path);
+            //     }
+            // }
+            
+            // Delete all user data (campaigns will be deleted due to CASCADE)
+            const result = await userRepository.deactivateUser(userId);
+            
+            if (result) {
+                return { success: true };
+            } else {
+                return { success: false, error: 'User not found' };
             }
-
-            const newToken = this.generateToken(user);
-            return { token: newToken };
         } catch (error) {
-            console.error('Error refreshing token:', error);
+            console.error('Error deleting account:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Get user with email credentials
+    async getUserWithEmailCredentials(userId) {
+        try {
+            return await userRepository.findByIdWithEmailCredentials(userId);
+        } catch (error) {
+            console.error('Error getting user with email credentials:', error);
+            throw error;
+        }
+    }
+
+    // Get user with Gemini credentials
+    async getUserWithGeminiCredentials(userId) {
+        try {
+            return await userRepository.findByIdWithGeminiCredentials(userId);
+        } catch (error) {
+            console.error('Error getting user with Gemini credentials:', error);
+            throw error;
+        }
+    }
+
+    // Get user with all credentials
+    async getUserWithAllCredentials(userId) {
+        try {
+            return await userRepository.findByIdWithAllCredentials(userId);
+        } catch (error) {
+            console.error('Error getting user with all credentials:', error);
             throw error;
         }
     }

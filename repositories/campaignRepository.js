@@ -1,4 +1,4 @@
-// repositories/campaignRepository.js (Updated with threading support - FIXED)
+// repositories/campaignRepository.js (Updated with threading support - FIXED with missing methods)
 import { query } from '../config/database.js';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -17,6 +17,11 @@ class CampaignRepository {
         `;
         const result = await query(sql, [userId]);
         return result.rows;
+    }
+
+    // ✅ ADDED: Missing getUserCampaigns method (alias for getCampaignsByUserId)
+    async getUserCampaigns(userId) {
+        return await this.getCampaignsByUserId(userId);
     }
 
     // Get campaign by ID (with user verification)
@@ -80,7 +85,7 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // 🔥 UPDATED: Update campaign with threading support
+    // Update campaign with threading support
     async updateCampaign(campaignId, userId, updateData) {
         const allowedFields = [
             'status', 'email_sent', 'last_follow_up', 'follow_up_count',
@@ -126,7 +131,7 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // 🔥 NEW: Update campaign with threading information
+    // Update campaign with threading information
     async updateCampaignThreading(campaignId, userId, threadingData) {
         const { messageId, threadId, inReplyTo = null, emailReferences = null } = threadingData;
         
@@ -145,7 +150,7 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // 🔥 NEW: Add follow-up to campaign_followups table
+    // Add follow-up to campaign_followups table
     async addFollowUp(followUpData) {
         const {
             campaignId,
@@ -175,7 +180,7 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // 🔥 NEW: Get follow-ups for a campaign
+    // Get follow-ups for a campaign
     async getFollowUpsByCampaignId(campaignId, userId) {
         const sql = `
             SELECT id, campaign_id, message_id, in_reply_to, email_references,
@@ -188,7 +193,7 @@ class CampaignRepository {
         return result.rows;
     }
 
-    // 🔥 UPDATED: Get campaigns for automated follow-up with threading info
+    // Get campaigns for automated follow-up with threading info
     async getCampaignsForFollowUp() {
         const sql = `
             SELECT id, user_id, recipient_email, company_name, job_title, 
@@ -221,7 +226,7 @@ class CampaignRepository {
         return result.rows;
     }
 
-    // Delete campaign
+    // ✅ ADDED: Missing deleteCampaign method
     async deleteCampaign(campaignId, userId) {
         // First delete associated follow-ups
         await query('DELETE FROM campaign_followups WHERE campaign_id = $1 AND user_id = $2', [campaignId, userId]);
@@ -233,7 +238,7 @@ class CampaignRepository {
             RETURNING id, resume_path
         `;
         const result = await query(sql, [campaignId, userId]);
-        return result.rows[0];
+        return result.rowCount > 0;
     }
 
     // Get old campaigns for cleanup
@@ -262,6 +267,11 @@ class CampaignRepository {
         return result.rowCount;
     }
 
+    // ✅ ADDED: Missing getCampaignStats method (alias for getUserCampaignStats)
+    async getCampaignStats(userId) {
+        return await this.getUserCampaignStats(userId);
+    }
+
     // Get campaign statistics for user
     async getUserCampaignStats(userId) {
         const sql = `
@@ -280,8 +290,10 @@ class CampaignRepository {
         return result.rows[0];
     }
 
-    // Search campaigns
-    async searchCampaigns(userId, searchTerm, filters = {}) {
+    // ✅ UPDATED: Fixed searchCampaigns method to match expected signature
+    async searchCampaigns(userId, searchOptions = {}) {
+        const { query: searchTerm, status, startDate, endDate } = searchOptions;
+        
         let sql = `
             SELECT id, recipient_email, recipient_name, company_name, 
                    job_title, status, created_at, email_sent, follow_up_count,
@@ -303,21 +315,21 @@ class CampaignRepository {
             paramCount++;
         }
 
-        if (filters.status) {
+        if (status) {
             sql += ` AND status = $${paramCount}`;
-            params.push(filters.status);
+            params.push(status);
             paramCount++;
         }
 
-        if (filters.dateFrom) {
+        if (startDate) {
             sql += ` AND created_at >= $${paramCount}`;
-            params.push(filters.dateFrom);
+            params.push(startDate);
             paramCount++;
         }
 
-        if (filters.dateTo) {
+        if (endDate) {
             sql += ` AND created_at <= $${paramCount}`;
-            params.push(filters.dateTo);
+            params.push(endDate);
             paramCount++;
         }
 
@@ -327,7 +339,7 @@ class CampaignRepository {
         return result.rows;
     }
 
-    // 🔥 UPDATED: Methods for common operations with threading support
+    // Methods for common operations with threading support
     async updateStatus(campaignId, userId, status, additionalData = {}) {
         const updateData = { status, ...additionalData };
         return await this.updateCampaign(campaignId, userId, updateData);
@@ -384,7 +396,7 @@ class CampaignRepository {
         });
     }
 
-    // 🔥 UPDATED: Method to update campaign with all email data at once including threading
+    // Method to update campaign with all email data at once including threading
     async updateCampaignWithEmailData(campaignId, userId, emailData) {
         const { status, emailContent, senderInfo, errorMessage, threadingData } = emailData;
         
@@ -415,7 +427,7 @@ class CampaignRepository {
         return await this.updateCampaign(campaignId, userId, updateData);
     }
 
-    // 🔥 NEW: Get email thread for a campaign
+    // Get email thread for a campaign
     async getEmailThread(campaignId, userId) {
         const campaign = await this.getCampaignById(campaignId, userId);
         if (!campaign) return null;

@@ -1,4 +1,4 @@
-// controllers/emailController.js (Updated with threading support)
+// controllers/emailController.js (FIXED - Parameter order issue)
 import { emailService } from '../services/emailService.js';
 import { campaignRepository } from '../repositories/campaignRepository.js';
 import { userRepository } from '../repositories/userRepository.js';
@@ -60,7 +60,7 @@ class EmailController {
             const campaign = await campaignRepository.addCampaign(campaignData);
             console.log(`✅ Campaign created with ID: ${campaign.id}`);
 
-            // 🔥 NEW: Generate thread ID for the campaign
+            // Generate thread ID for the campaign
             const threadId = generateThreadId(campaign.id);
 
             // Background processing
@@ -74,8 +74,9 @@ class EmailController {
                     const resumeText = await emailService.extractResumeText(req.file.path);
                     console.log(`📄 Resume text extracted: ${resumeText.length} characters`);
                     
-                    // Extract sender information from resume
-                    const senderInfo = await emailService.extractSenderInfo(resumeText);
+                    // ✅ FIXED: Extract sender information from resume (correct parameter order)
+                    console.log(`🔍 Extracting sender info for user ID: ${req.user.user_id}`);
+                    const senderInfo = await emailService.extractSenderInfo(req.user.user_id, resumeText);
                     console.log(`📝 Sender info extracted:`, {
                         name: senderInfo.fullName,
                         email: senderInfo.email,
@@ -87,7 +88,7 @@ class EmailController {
                     await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                         status: 'researching',
                         senderInfo: senderInfo,
-                        threadId: threadId  // 🔥 NEW: Set thread ID
+                        threadId: threadId
                     });
                     console.log(`🔍 Campaign ${campaign.id} status: researching`);
 
@@ -95,45 +96,43 @@ class EmailController {
                     const companyInfo = await emailService.researchCompany(companyName, companyWebsite);
                     console.log(`🏢 Company research completed for ${companyName}`);
 
-                    // Generate personalized email
-                    console.log(`🤖 Generating personalized email...`);
+                    // ✅ FIXED: Generate personalized email (correct parameter order)
+                    console.log(`🤖 Generating personalized email for user ID: ${req.user.user_id}...`);
                     const generatedEmail = await emailService.generatePersonalizedEmail(
-                        companyInfo,
-                        resumeText,
-                        senderInfo,
-                        emailType,
-                        jobTitle,
-                        recipientName,
-                        additionalInfo
+                        req.user.user_id,     // ✅ FIXED: userId first
+                        companyInfo,          // then companyInfo
+                        resumeText,           // then resumeText
+                        senderInfo,           // then senderInfo
+                        emailType,            // then emailType
+                        jobTitle,             // then jobTitle
+                        recipientName,        // then recipientName
+                        additionalInfo        // then additionalInfo
                     );
 
                     // Extract subject and body
                     const subjectMatch = generatedEmail.match(/Subject:\s*(.+)/);
-                    const subject = subjectMatch ? subjectMatch[1].trim() : `Application for ${jobTitle} position`;
+                    const subject = subjectMatch ? subjectMatch[1].trim() : `Application for ${jobTitle} Position at ${companyName}`;
+                    const bodyMatch = generatedEmail.split('\n\n').slice(1).join('\n\n');
                     
-                    const bodyStart = generatedEmail.indexOf('\n\n') + 2;
-                    const body = generatedEmail.substring(bodyStart).trim();
-
                     console.log(`📧 Email generated - Subject: ${subject}`);
 
-                    // 🔥 NEW: Prepare threading options for original email
-                    const threadingOptions = {
-                        threadId: threadId,
-                        campaignType: 'original',
-                        followUpNumber: 0,
-                        isReply: false
-                    };
+                    // Update status to sending
+                    await campaignRepository.updateStatus(campaign.id, req.user.user_id, 'sending');
 
-                    // Send email with resume attachment
+                    // Send email with threading support
                     const emailResult = await emailService.sendEmail(
-                        recipientEmail, 
-                        subject, 
-                        body, 
-                        senderInfo, 
+                        recipientEmail,
+                        subject,
+                        bodyMatch || generatedEmail,
+                        senderInfo,
                         req.file.path,
                         req.user.user_id,
                         userEmailCredentials,
-                        threadingOptions  // 🔥 NEW: Include threading options
+                        {
+                            threadId: threadId,
+                            campaignType: 'original',
+                            followUpNumber: 0
+                        }
                     );
 
                     console.log(`📧 Email send result:`, {
@@ -145,226 +144,65 @@ class EmailController {
                     });
 
                     if (emailResult.success) {
-                        // 🔥 UPDATED: Include threading data when marking as sent
-                        await campaignRepository.updateCampaignWithEmailData(campaign.id, req.user.user_id, {
+                        // Update campaign with success data
+                        await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                             status: 'sent',
-                            emailContent: generatedEmail,
-                            senderInfo: senderInfo,
-                            errorMessage: null,
-                            threadingData: {  // 🔥 NEW: Threading information
-                                messageId: emailResult.threadingMessageId,
-                                threadId: threadId,
-                                inReplyTo: null,
-                                references: null
-                            }
+                            emailSent: new Date(),
+                            originalEmail: generatedEmail,
+                            emailPreview: subject,
+                            messageId: emailResult.threadingMessageId,
+                            threadId: emailResult.threadId
                         });
-                        
-                        console.log(`✅ Campaign ${campaign.id} completed successfully via ${emailResult.method}`);
+                        console.log(`✅ Campaign ${campaign.id} completed successfully`);
                     } else {
-                        await campaignRepository.updateCampaignWithEmailData(campaign.id, req.user.user_id, {
+                        // Update campaign with error
+                        await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                             status: 'failed',
-                            emailContent: generatedEmail,
-                            senderInfo: senderInfo,
                             errorMessage: emailResult.error
                         });
-                        
-                        console.error(`❌ Campaign ${campaign.id} failed:`, emailResult.error);
+                        console.log(`❌ Campaign ${campaign.id} failed: ${emailResult.error}`);
                     }
 
                 } catch (error) {
-                    console.error('❌ Error in background processing:', error);
-                    await campaignRepository.updateCampaignWithEmailData(campaign.id, req.user.user_id, {
+                    console.error(`❌ Error in background processing:`, error);
+                    
+                    // Update campaign with error
+                    await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
                         status: 'failed',
-                        emailContent: null,
-                        senderInfo: null,
                         errorMessage: error.message
                     });
                 }
             })();
 
-            // Immediate response to user
+            // Return immediate response
             res.json({
                 success: true,
+                message: 'Email campaign initiated successfully',
                 campaignId: campaign.id,
-                status: 'pending',
-                threadId: threadId,  // 🔥 NEW: Include thread ID in response
-                message: userEmailCredentials 
-                    ? `Email campaign started. AI is processing your resume and will send the email from ${userEmailCredentials.email}.`
-                    : 'Email campaign started. AI is processing your resume and will send the email using fallback SMTP (reply-to will be set to your email).',
-                campaign: {
-                    id: campaign.id,
-                    recipientEmail: campaign.recipient_email,
-                    companyName: campaign.company_name,
-                    jobTitle: campaign.job_title,
-                    status: campaign.status,
-                    createdAt: campaign.created_at
-                },
-                emailMethod: userEmailCredentials ? 'user_gmail' : 'fallback_smtp'
+                status: 'processing'
             });
 
         } catch (error) {
-            console.error('❌ Error in send-email endpoint:', error);
-            res.status(500).json({ error: error.message });
-        }
-    }
-
-    // 🔥 UPDATED: Send follow-up email with proper threading
-    async sendFollowUp(req, res) {
-        try {
-            const { id } = req.params;
-            console.log(`📧 Sending follow-up for campaign ${id}`);
-            
-            const campaign = await campaignRepository.getCampaignById(id, req.user.user_id);
-            
-            if (!campaign) {
-                return res.status(404).json({ error: 'Campaign not found' });
-            }
-
-            if (campaign.status !== 'sent') {
-                return res.status(400).json({ 
-                    error: 'Can only follow up on sent campaigns' 
-                });
-            }
-
-            if (!campaign.sender_info) {
-                return res.status(400).json({ 
-                    error: 'Sender information not available' 
-                });
-            }
-
-            if (campaign.follow_up_count >= 2) {
-                return res.status(400).json({ 
-                    error: 'Maximum follow-ups (2) already sent' 
-                });
-            }
-
-            // 🔥 NEW: Check for threading information
-            if (!campaign.message_id || !campaign.thread_id) {
-                return res.status(400).json({ 
-                    error: 'Original email threading information not available' 
-                });
-            }
-
-            const followUpNumber = (campaign.follow_up_count || 0) + 1;
-
-            // Extract original subject for threading
-            const originalSubject = campaign.original_email ? 
-                campaign.original_email.match(/Subject:\s*(.+)/)?.[1]?.trim() : 
-                `${campaign.job_title} Application`;
-
-            // Generate follow-up email
-            const followUpEmail = await emailService.generateFollowUpEmail(
-                campaign.original_email,
-                campaign.company_name,
-                campaign.job_title,
-                campaign.sender_info,
-                followUpNumber,
-                originalSubject
-            );
-
-            // Extract subject and body
-            const subjectMatch = followUpEmail.match(/Subject:\s*(.+)/);
-            const subject = subjectMatch ? 
-                subjectMatch[1].trim() : 
-                formatFollowUpSubject(originalSubject, followUpNumber);
-            
-            const bodyStart = followUpEmail.indexOf('\n\n') + 2;
-            const body = followUpEmail.substring(bodyStart).trim();
-
-            // Get user's email credentials
-            const userWithCredentials = await userRepository.findByIdWithEmailCredentials(req.user.user_id);
-            const userEmailCredentials = userWithCredentials && userWithCredentials.has_email_credentials ? {
-                email: userWithCredentials.email,
-                appPassword: userWithCredentials.email_password
-            } : null;
-
-            // 🔥 NEW: Prepare threading options for follow-up email
-            const threadingOptions = {
-                originalMessageId: campaign.message_id,
-                threadId: campaign.thread_id,
-                emailReferences: campaign.email_references || campaign.message_id,
-                campaignType: 'followup',
-                followUpNumber: followUpNumber,
-                isReply: true  // 🔥 NEW: This is a reply to the original email
-            };
-
-            console.log(`📧 Follow-up threading options:`, threadingOptions);
-
-            // Send follow-up email (without attachment)
-            const emailResult = await emailService.sendEmail(
-                campaign.recipient_email, 
-                subject, 
-                body, 
-                campaign.sender_info, 
-                null, // No attachment for follow-ups
-                req.user.user_id,
-                userEmailCredentials,
-                threadingOptions  // 🔥 NEW: Include threading options for proper reply
-            );
-
-            console.log(`📧 Follow-up email result:`, {
-                success: emailResult.success,
-                method: emailResult.method,
-                threadingMessageId: emailResult.threadingMessageId,
-                inReplyTo: campaign.message_id,
-                error: emailResult.error
+            console.error('Error in sendEmail:', error);
+            res.status(500).json({ 
+                error: 'Failed to initiate email campaign',
+                details: process.env.NODE_ENV === 'development' ? error.message : undefined
             });
-
-            if (emailResult.success) {
-                // 🔥 NEW: Store follow-up in separate table for thread tracking
-                await campaignRepository.addFollowUp({
-                    campaignId: campaign.id,
-                    userId: req.user.user_id,
-                    messageId: emailResult.threadingMessageId,
-                    inReplyTo: campaign.message_id,
-                    emailReferences: threadingOptions.emailReferences,
-                    subject: subject,
-                    emailContent: followUpEmail,
-                    followupNumber: followUpNumber
-                });
-
-                // Update campaign with follow-up info and latest threading data
-                await campaignRepository.updateCampaign(campaign.id, req.user.user_id, {
-                    followUpCount: followUpNumber,
-                    lastFollowUp: new Date(),
-                    emailReferences: `${threadingOptions.emailReferences} ${emailResult.threadingMessageId}`.trim()
-                });
-                
-                res.json({
-                    success: true,
-                    message: `Follow-up email sent successfully via ${emailResult.method}`,
-                    followUpCount: followUpNumber,
-                    method: emailResult.method,
-                    threadingInfo: {
-                        messageId: emailResult.threadingMessageId,
-                        inReplyTo: campaign.message_id,
-                        threadId: campaign.thread_id,
-                        isThreaded: true
-                    }
-                });
-            } else {
-                res.status(500).json({ 
-                    error: `Failed to send follow-up: ${emailResult.error}` 
-                });
-            }
-
-        } catch (error) {
-            console.error('Error sending follow-up:', error);
-            res.status(500).json({ error: 'Failed to send follow-up email' });
         }
     }
 
-    // Get user's campaigns
+    // Get user campaigns
     async getUserCampaigns(req, res) {
         try {
-            const campaigns = await campaignRepository.getCampaignsByUserId(req.user.user_id);
+            const campaigns = await campaignRepository.getUserCampaigns(req.user.user_id);
             
-            // Format campaigns for frontend
+            // Format campaigns for response (exclude sensitive data)
             const formattedCampaigns = campaigns.map(campaign => ({
                 id: campaign.id,
                 recipientEmail: campaign.recipient_email,
                 recipientName: campaign.recipient_name,
                 companyName: campaign.company_name,
+                companyWebsite: campaign.company_website,
                 jobTitle: campaign.job_title,
                 emailType: campaign.email_type,
                 status: campaign.status,
@@ -373,9 +211,9 @@ class EmailController {
                 emailSent: campaign.email_sent,
                 lastFollowUp: campaign.last_follow_up,
                 followUpCount: campaign.follow_up_count,
-                errorMessage: campaign.error_message,
                 emailPreview: campaign.email_preview,
-                // 🔥 NEW: Include threading information
+                errorMessage: campaign.error_message,
+                // Threading information
                 threadingInfo: {
                     messageId: campaign.message_id,
                     threadId: campaign.thread_id,
@@ -398,26 +236,31 @@ class EmailController {
     // Search campaigns
     async searchCampaigns(req, res) {
         try {
-            const { q: searchTerm, status, dateFrom, dateTo } = req.query;
-            const filters = { status, dateFrom, dateTo };
+            const { query: searchQuery, status, startDate, endDate } = req.query;
             
-            console.log(`🔍 Searching campaigns for user ${req.user.user_id}:`, {
-                searchTerm,
-                filters
+            const campaigns = await campaignRepository.searchCampaigns(req.user.user_id, {
+                query: searchQuery,
+                status,
+                startDate,
+                endDate
             });
-            
-            const campaigns = await campaignRepository.searchCampaigns(
-                req.user.user_id, 
-                searchTerm, 
-                filters
-            );
-            
+
+            const formattedCampaigns = campaigns.map(campaign => ({
+                id: campaign.id,
+                recipientEmail: campaign.recipient_email,
+                recipientName: campaign.recipient_name,
+                companyName: campaign.company_name,
+                jobTitle: campaign.job_title,
+                status: campaign.status,
+                createdAt: campaign.created_at,
+                emailSent: campaign.email_sent,
+                emailPreview: campaign.email_preview
+            }));
+
             res.json({
                 success: true,
-                campaigns: campaigns,
-                searchTerm: searchTerm,
-                filters: filters,
-                count: campaigns.length
+                campaigns: formattedCampaigns,
+                count: formattedCampaigns.length
             });
         } catch (error) {
             console.error('Error searching campaigns:', error);
@@ -429,34 +272,17 @@ class EmailController {
     async deleteCampaign(req, res) {
         try {
             const { id } = req.params;
-            console.log(`🗑️ Deleting campaign ${id} for user ${req.user.user_id}`);
             
-            const deletedCampaign = await campaignRepository.deleteCampaign(id, req.user.user_id);
+            const success = await campaignRepository.deleteCampaign(id, req.user.user_id);
             
-            if (!deletedCampaign) {
-                return res.status(404).json({ error: 'Campaign not found' });
+            if (success) {
+                res.json({
+                    success: true,
+                    message: 'Campaign deleted successfully'
+                });
+            } else {
+                res.status(404).json({ error: 'Campaign not found' });
             }
-
-            // Delete resume file if it exists
-            if (deletedCampaign.resume_path) {
-                try {
-                    const fs = await import('fs');
-                    if (fs.default.existsSync(deletedCampaign.resume_path)) {
-                        fs.default.unlinkSync(deletedCampaign.resume_path);
-                        console.log(`🗑️ Deleted resume file: ${deletedCampaign.resume_path}`);
-                    }
-                } catch (fileError) {
-                    console.error('Error deleting resume file:', fileError);
-                }
-            }
-
-            console.log(`✅ Campaign ${id} deleted successfully`);
-
-            res.json({
-                success: true,
-                message: 'Campaign deleted successfully',
-                campaignId: id
-            });
         } catch (error) {
             console.error('Error deleting campaign:', error);
             res.status(500).json({ error: 'Failed to delete campaign' });
@@ -466,25 +292,28 @@ class EmailController {
     // Get campaign statistics
     async getCampaignStats(req, res) {
         try {
-            const stats = await campaignRepository.getUserCampaignStats(req.user.user_id);
+            const stats = await campaignRepository.getCampaignStats(req.user.user_id);
             
             // Calculate additional metrics
             const totalCampaigns = parseInt(stats.total_campaigns) || 0;
             const sentCampaigns = parseInt(stats.sent_campaigns) || 0;
+            const pendingCampaigns = parseInt(stats.pending_campaigns) || 0;
+            const failedCampaigns = parseInt(stats.failed_campaigns) || 0;
+            
             const successRate = totalCampaigns > 0 ? 
                 ((sentCampaigns / totalCampaigns) * 100).toFixed(1) : 0;
+            
+            const avgFollowUpsPerCampaign = sentCampaigns > 0 ? 
+                ((parseInt(stats.total_followups) || 0) / sentCampaigns).toFixed(1) : 0;
 
             const formattedStats = {
                 totalCampaigns,
                 sentCampaigns,
-                failedCampaigns: parseInt(stats.failed_campaigns) || 0,
-                pendingCampaigns: parseInt(stats.pending_campaigns) || 0,
-                processingCampaigns: parseInt(stats.processing_campaigns) || 0,
-                totalFollowups: parseInt(stats.total_followups) || 0,
+                pendingCampaigns,
+                failedCampaigns,
                 successRate: parseFloat(successRate),
-                lastCampaignDate: stats.last_campaign_date,
-                averageFollowupsPerCampaign: sentCampaigns > 0 ? 
-                    ((parseInt(stats.total_followups) || 0) / sentCampaigns).toFixed(1) : 0
+                totalFollowups: parseInt(stats.total_followups) || 0,
+                avgFollowUpsPerCampaign: parseFloat(avgFollowUpsPerCampaign)
             };
 
             res.json({
@@ -507,7 +336,7 @@ class EmailController {
                 return res.status(404).json({ error: 'Campaign not found' });
             }
 
-            // 🔥 NEW: Get email thread information
+            // Get email thread information
             const emailThread = await campaignRepository.getEmailThread(id, req.user.user_id);
 
             // Format campaign data (exclude sensitive file paths)
@@ -530,7 +359,7 @@ class EmailController {
                 emailPreview: campaign.email_preview,
                 senderInfo: campaign.sender_info,
                 errorMessage: campaign.error_message,
-                // 🔥 NEW: Include threading information
+                // Include threading information
                 threadingInfo: {
                     messageId: campaign.message_id,
                     threadId: campaign.thread_id,
@@ -538,7 +367,7 @@ class EmailController {
                     emailReferences: campaign.email_references,
                     hasThread: !!(campaign.message_id && campaign.thread_id)
                 },
-                // 🔥 NEW: Include full email thread
+                // Include full email thread
                 emailThread: emailThread
             };
 
