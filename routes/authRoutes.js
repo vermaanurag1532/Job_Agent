@@ -8,6 +8,9 @@ import { emailService } from '../services/emailService.js';
 
 const router = express.Router();
 
+// Get frontend URL from environment variable with fallback
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3001';
+
 // Google OAuth routes
 router.get('/google', (req, res, next) => {
     console.log('🔐 Starting Google OAuth flow...');
@@ -25,12 +28,12 @@ router.get('/google/callback', (req, res, next) => {
         try {
             if (err) {
                 console.error('❌ OAuth error:', err);
-                return res.redirect(`http://localhost:3001/login?error=oauth_error`);
+                return res.redirect(`${FRONTEND_URL}/login?error=oauth_error`);
             }
             
             if (!user) {
                 console.error('❌ No user returned from OAuth:', info);
-                return res.redirect(`http://localhost:3001/login?error=oauth_failed`);
+                return res.redirect(`${FRONTEND_URL}/login?error=oauth_failed`);
             }
             
             console.log('✅ OAuth successful for user:', user.email);
@@ -64,11 +67,11 @@ router.get('/google/callback', (req, res, next) => {
             
             // Redirect to frontend with success
             console.log('🔄 Redirecting to frontend dashboard...');
-            res.redirect(`http://localhost:3001/dashboard?auth=success`);
+            res.redirect(`${FRONTEND_URL}/dashboard?auth=success`);
             
         } catch (error) {
             console.error('❌ OAuth callback error:', error);
-            res.redirect(`http://localhost:3001/login?error=server_error`);
+            res.redirect(`${FRONTEND_URL}/login?error=server_error`);
         }
     })(req, res, next);
 });

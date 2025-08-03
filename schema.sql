@@ -111,3 +111,9 @@ DROP INDEX IF EXISTS idx_campaigns_references;
 DROP INDEX IF EXISTS idx_followups_references;
 CREATE INDEX idx_campaigns_email_references ON campaigns(email_references);
 CREATE INDEX idx_followups_email_references ON campaign_followups(email_references);
+
+ALTER TABLE users ADD COLUMN gemini_api_key TEXT;
+ALTER TABLE users ADD COLUMN has_gemini_api_key BOOLEAN DEFAULT false;
+
+-- Create index for performance
+CREATE INDEX idx_users_gemini_api_key ON users(has_gemini_api_key);
