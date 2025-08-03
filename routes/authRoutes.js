@@ -17,6 +17,7 @@ router.get('/google', (req, res, next) => {
     })(req, res, next);
 });
 
+// FIXED: Google OAuth callback with better cookie handling
 router.get('/google/callback', (req, res, next) => {
     console.log('📥 Received Google OAuth callback');
     
@@ -24,12 +25,12 @@ router.get('/google/callback', (req, res, next) => {
         try {
             if (err) {
                 console.error('❌ OAuth error:', err);
-                return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=oauth_error`);
+                return res.redirect(`http://localhost:3001/login?error=oauth_error`);
             }
             
             if (!user) {
                 console.error('❌ No user returned from OAuth:', info);
-                return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=oauth_failed`);
+                return res.redirect(`http://localhost:3001/login?error=oauth_failed`);
             }
             
             console.log('✅ OAuth successful for user:', user.email);
@@ -44,30 +45,39 @@ router.get('/google/callback', (req, res, next) => {
                 { expiresIn: '7d' }
             );
             
-            // Set HTTP-only cookie
-            res.cookie('token', token, {
-                httpOnly: true,
-                secure: true,
-                sameSite: 'none',
-                maxAge: 7 * 24 * 60 * 60 * 1000,
-                domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
-            });
+            console.log('🔑 JWT token generated successfully');
             
-            console.log('🍪 Token cookie set successfully');
+            // FIXED: Set cookie with proper options for development
+            const cookieOptions = {
+                httpOnly: true,
+                secure: false, // Set to false for development (localhost)
+                sameSite: 'lax', // Changed from 'none' to 'lax' for same-origin requests
+                maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+                path: '/' // Ensure cookie is available for all paths
+            };
+            
+            res.cookie('token', token, cookieOptions);
+            console.log('🍪 Token cookie set with options:', cookieOptions);
+            
+            // ALTERNATIVE: Set cookie in multiple ways for better compatibility
+            res.cookie('auth_token', token, cookieOptions);
             
             // Redirect to frontend with success
-            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?auth=success`);
+            console.log('🔄 Redirecting to frontend dashboard...');
+            res.redirect(`http://localhost:3001/dashboard?auth=success`);
             
         } catch (error) {
             console.error('❌ OAuth callback error:', error);
-            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3001'}/login?error=server_error`);
+            res.redirect(`http://localhost:3001/login?error=server_error`);
         }
     })(req, res, next);
 });
 
-// Check authentication status
+// FIXED: Check authentication status with better logging
 router.get('/status', authenticateToken, async (req, res) => {
     try {
+        console.log('🔍 Auth status check for user:', req.user.email);
+        
         const userInfo = {
             authenticated: true,
             user: {
@@ -85,7 +95,7 @@ router.get('/status', authenticateToken, async (req, res) => {
         console.log('✅ Auth status check successful for:', req.user.email);
         res.json(userInfo);
     } catch (error) {
-        console.error('Auth status error:', error);
+        console.error('❌ Auth status error:', error);
         res.status(500).json({ 
             authenticated: false, 
             error: 'Failed to get auth status' 
@@ -382,20 +392,21 @@ router.delete('/gemini-credentials', authenticateToken, async (req, res) => {
     }
 });
 
-// Logout
+// FIXED: Logout with better cookie clearing
 router.post('/logout', authenticateToken, async (req, res) => {
     try {
         await authService.logout(req.user.user_id);
         
-        // Clear ALL possible cookies
+        // FIXED: Clear cookies with same options as when they were set
         const cookieOptions = {
             httpOnly: true,
-            secure: true,
-            sameSite: 'none',
-            domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
+            secure: false, // Same as when setting for development
+            sameSite: 'lax',
+            path: '/'
         };
         
         res.clearCookie('token', cookieOptions);
+        res.clearCookie('auth_token', cookieOptions);
         res.clearCookie('connect.sid', cookieOptions);
         
         console.log('👋 User logged out successfully');
@@ -419,12 +430,13 @@ router.delete('/account', authenticateToken, async (req, res) => {
             // Clear cookies
             const cookieOptions = {
                 httpOnly: true,
-                secure: true,
-                sameSite: 'none',
-                domain: process.env.NODE_ENV === 'production' ? '.mmcgroups.com' : undefined
+                secure: false,
+                sameSite: 'lax',
+                path: '/'
             };
             
             res.clearCookie('token', cookieOptions);
+            res.clearCookie('auth_token', cookieOptions);
             res.clearCookie('connect.sid', cookieOptions);
             
             console.log('🗑️ Account deleted successfully for user:', req.user.email);

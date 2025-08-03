@@ -75,9 +75,9 @@ app.use(session({
     saveUninitialized: false,
     rolling: true, // Reset expiration on activity
     cookie: {
-        secure: true,  // Always true for HTTPS
         httpOnly: true,
-        sameSite: 'none',  // Required for cross-origin
+        secure: false,
+        sameSite: 'none',
         maxAge: 7 * 24 * 60 * 60 * 1000,
         domain: undefined  // Don't set domain for cross-origin
     }

@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// JWT Authentication Middleware - Enhanced for cookie + header support
+// FIXED: JWT Authentication Middleware with better cookie handling
 export const authenticateToken = async (req, res, next) => {
     try {
         // Try to get token from multiple sources
@@ -14,29 +14,40 @@ export const authenticateToken = async (req, res, next) => {
         const authHeader = req.headers['authorization'];
         if (authHeader && authHeader.startsWith('Bearer ')) {
             token = authHeader.split(' ')[1];
+            console.log('🔑 Token found in Authorization header');
         }
         
-        // 2. Check cookies (for browser requests)
-        if (!token && req.cookies && req.cookies.auth_token) {
-            token = req.cookies.auth_token;
+        // 2. Check cookies (for browser requests) - FIXED: Check both cookie names
+        if (!token && req.cookies) {
+            // Try multiple cookie names that might contain the token
+            token = req.cookies.token || req.cookies.auth_token || req.cookies['connect.sid'];
+            if (token) {
+                console.log('🔑 Token found in cookies');
+            }
         }
         
         // 3. Check query parameter (fallback, less secure)
         if (!token && req.query.token) {
             token = req.query.token;
+            console.log('🔑 Token found in query params');
         }
 
         if (!token) {
+            console.log('❌ No token found in request');
             return res.status(401).json({ 
                 error: 'Access denied. No token provided.',
                 code: 'NO_TOKEN'
             });
         }
 
+        console.log('🔍 Verifying token...');
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await userRepository.findById(decoded.userId);
+        console.log('✅ Token decoded:', { user_id: decoded.user_id, email: decoded.email });
+        
+        const user = await userRepository.findById(decoded.user_id);
 
         if (!user) {
+            console.log('❌ User not found for token');
             return res.status(401).json({ 
                 error: 'Invalid token. User not found.',
                 code: 'USER_NOT_FOUND'
@@ -45,17 +56,22 @@ export const authenticateToken = async (req, res, next) => {
 
         // Check if user is still active
         if (!user.is_active) {
+            console.log('❌ User account deactivated');
             return res.status(401).json({ 
                 error: 'User account is deactivated.',
                 code: 'USER_DEACTIVATED'
             });
         }
 
+        console.log('✅ User authenticated:', user.email);
+        
         // Add user to request object
         req.user = user;
         req.token = token; // Store token for potential refresh
         next();
     } catch (error) {
+        console.log('❌ Token verification failed:', error.message);
+        
         if (error.name === 'JsonWebTokenError') {
             return res.status(401).json({ 
                 error: 'Invalid token.',
@@ -85,15 +101,15 @@ export const optionalAuth = async (req, res, next) => {
         const authHeader = req.headers['authorization'];
         if (authHeader && authHeader.startsWith('Bearer ')) {
             token = authHeader.split(' ')[1];
-        } else if (req.cookies && req.cookies.auth_token) {
-            token = req.cookies.auth_token;
+        } else if (req.cookies) {
+            token = req.cookies.token || req.cookies.auth_token || req.cookies['connect.sid'];
         } else if (req.query.token) {
             token = req.query.token;
         }
 
         if (token) {
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            const user = await userRepository.findById(decoded.userId);
+            const user = await userRepository.findById(decoded.user_id);
             
             if (user && user.is_active) {
                 req.user = user;
@@ -234,14 +250,16 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000); // Clean every 5 minutes
 
-// Middleware to handle CORS preflight requests
+// FIXED: Middleware to handle CORS preflight requests
 export const handleCORS = (req, res, next) => {
+    // Set CORS headers for all requests
+    res.header('Access-Control-Allow-Origin', 'http://localhost:3001');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cookie');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    
     // Handle preflight requests
     if (req.method === 'OPTIONS') {
-        res.header('Access-Control-Allow-Origin', process.env.FRONTEND_URL || 'http://localhost:3001');
-        res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-        res.header('Access-Control-Allow-Credentials', 'true');
         return res.status(200).end();
     }
     next();
