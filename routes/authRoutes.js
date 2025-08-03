@@ -54,8 +54,9 @@ router.get('/google/callback', (req, res, next) => {
             const cookieOptions = {
                 httpOnly: true,
                 secure: false, // Set to false for development (localhost)
-                sameSite: 'lax', // Changed from 'none' to 'lax' for same-origin requests
+                sameSite: 'none', // Changed from 'none' to 'lax' for same-origin requests
                 maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+                domain: undefined,
                 path: '/' // Ensure cookie is available for all paths
             };
             
