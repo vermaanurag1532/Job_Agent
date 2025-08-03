@@ -401,7 +401,8 @@ router.post('/logout', authenticateToken, async (req, res) => {
         const cookieOptions = {
             httpOnly: true,
             secure: false, // Same as when setting for development
-            sameSite: 'lax',
+            sameSite: 'none',
+            domain: undefined,
             path: '/'
         };
         
@@ -431,7 +432,8 @@ router.delete('/account', authenticateToken, async (req, res) => {
             const cookieOptions = {
                 httpOnly: true,
                 secure: false,
-                sameSite: 'lax',
+                sameSite: 'none',
+                domain: undefined,
                 path: '/'
             };
             
