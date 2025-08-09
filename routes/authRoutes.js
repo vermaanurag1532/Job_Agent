@@ -2,7 +2,7 @@ import express from 'express';
 import passport from 'passport';
 import jwt from 'jsonwebtoken';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { authenticateToken } from '../middleware/authMiddleware.js';
+import { authenticateToken, sendTokenToFrontend, tokenTest } from '../middleware/authMiddleware.js';
 import { authService } from '../services/authService.js';
 import { emailService } from '../services/emailService.js';
 
@@ -11,18 +11,23 @@ const router = express.Router();
 // Get frontend URL from environment variable with fallback
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3001';
 
+console.log('🌐 Auth routes configured with FRONTEND_URL:', FRONTEND_URL);
+
 // Google OAuth routes
 router.get('/google', (req, res, next) => {
     console.log('🔐 Starting Google OAuth flow...');
+    console.log('🌐 Will redirect to:', FRONTEND_URL);
+    
     passport.authenticate('google', { 
         scope: ['profile', 'email'],
         prompt: 'select_account'
     })(req, res, next);
 });
 
-// FIXED: Google OAuth callback with better cookie handling
+// Enhanced Google OAuth callback with dynamic frontend URL
 router.get('/google/callback', (req, res, next) => {
     console.log('📥 Received Google OAuth callback');
+    console.log('🌐 Frontend URL from env:', FRONTEND_URL);
     
     passport.authenticate('google', { session: false }, async (err, user, info) => {
         try {
@@ -50,25 +55,8 @@ router.get('/google/callback', (req, res, next) => {
             
             console.log('🔑 JWT token generated successfully');
             
-            // FIXED: Set cookie with proper options for development
-            const cookieOptions = {
-                httpOnly: true,
-                secure: false, // Set to false for development (localhost)
-                sameSite: 'none', // Changed from 'none' to 'lax' for same-origin requests
-                maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-                domain: undefined,
-                path: '/' // Ensure cookie is available for all paths
-            };
-            
-            res.cookie('token', token, cookieOptions);
-            console.log('🍪 Token cookie set with options:', cookieOptions);
-            
-            // ALTERNATIVE: Set cookie in multiple ways for better compatibility
-            res.cookie('auth_token', token, cookieOptions);
-            
-            // Redirect to frontend with success
-            console.log('🔄 Redirecting to frontend dashboard...');
-            res.redirect(`${FRONTEND_URL}/dashboard?auth=success`);
+            // Use the helper function to send token to frontend
+            return sendTokenToFrontend(res, req, token, '/dashboard');
             
         } catch (error) {
             console.error('❌ OAuth callback error:', error);
@@ -77,10 +65,11 @@ router.get('/google/callback', (req, res, next) => {
     })(req, res, next);
 });
 
-// FIXED: Check authentication status with better logging
+// Enhanced auth status check with better debugging
 router.get('/status', authenticateToken, async (req, res) => {
     try {
         console.log('🔍 Auth status check for user:', req.user.email);
+        console.log('🌐 Request origin:', req.headers.origin);
         
         const userInfo = {
             authenticated: true,
@@ -93,7 +82,9 @@ router.get('/status', authenticateToken, async (req, res) => {
                 lastLogin: req.user.last_login,
                 hasEmailCredentials: req.user.has_email_credentials,
                 hasGeminiApiKey: req.user.has_gemini_api_key
-            }
+            },
+            frontendUrl: FRONTEND_URL,
+            serverTime: new Date().toISOString()
         };
         
         console.log('✅ Auth status check successful for:', req.user.email);
@@ -102,10 +93,14 @@ router.get('/status', authenticateToken, async (req, res) => {
         console.error('❌ Auth status error:', error);
         res.status(500).json({ 
             authenticated: false, 
-            error: 'Failed to get auth status' 
+            error: 'Failed to get auth status',
+            frontendUrl: FRONTEND_URL
         });
     }
 });
+
+// Token accessibility test endpoint
+router.get('/token-test', authenticateToken, tokenTest);
 
 // Test email credentials
 router.post('/test-email-credentials', authenticateToken, async (req, res) => {
@@ -118,7 +113,6 @@ router.post('/test-email-credentials', authenticateToken, async (req, res) => {
             });
         }
         
-        // Test the credentials with the user's email
         const isValid = await emailService.testEmailCredentials(req.user.email, emailPassword);
         
         if (isValid) {
@@ -167,7 +161,6 @@ router.post('/save-email-credentials', authenticateToken, async (req, res) => {
             });
         }
         
-        // Save the encrypted credentials
         const result = await authService.saveEmailCredentials(req.user.user_id, emailPassword);
         
         res.json({ 
@@ -196,12 +189,10 @@ router.post('/test-gemini-credentials', authenticateToken, async (req, res) => {
             });
         }
         
-        // Test the Gemini API key
         try {
             const genAI = new GoogleGenerativeAI(geminiApiKey);
             const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
             
-            // Test with a simple prompt
             const result = await model.generateContent('Test message. Please respond with "API key is working"');
             const response = await result.response;
             const text = response.text();
@@ -261,7 +252,6 @@ router.post('/save-gemini-credentials', authenticateToken, async (req, res) => {
             });
         }
         
-        // Save the encrypted API key
         const result = await authService.saveGeminiCredentials(req.user.user_id, geminiApiKey);
         
         res.json({ 
@@ -293,7 +283,8 @@ router.get('/me', authenticateToken, async (req, res) => {
                 hasEmailCredentials: req.user.has_email_credentials,
                 hasGeminiApiKey: req.user.has_gemini_api_key
             },
-            stats: await authService.getUserStats(req.user.user_id)
+            stats: await authService.getUserStats(req.user.user_id),
+            frontendUrl: FRONTEND_URL
         };
         
         res.json(userInfo);
@@ -303,40 +294,49 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 });
 
-// Get email credentials status
-router.get('/email-status', authenticateToken, async (req, res) => {
+// Enhanced logout with proper cookie clearing
+router.post('/logout', authenticateToken, async (req, res) => {
     try {
-        const { userRepository } = await import('../repositories/userRepository.js');
-        const user = await userRepository.findById(req.user.user_id);
+        await authService.logout(req.user.user_id);
         
-        res.json({
-            hasEmailCredentials: user.has_email_credentials,
-            email: user.email,
-            canSendEmails: user.has_email_credentials
+        // Clear cookies with same options as when they were set
+        const cookieOptions = {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+            path: '/'
+        };
+        
+        // Set domain if in production
+        if (process.env.NODE_ENV === 'production' && req.headers.origin) {
+            try {
+                const url = new URL(req.headers.origin);
+                if (url.hostname.includes('jwelease.com')) {
+                    cookieOptions.domain = '.jwelease.com';
+                }
+            } catch (error) {
+                console.warn('Could not parse origin for logout:', req.headers.origin);
+            }
+        }
+        
+        res.clearCookie('token', cookieOptions);
+        res.clearCookie('auth_token', cookieOptions);
+        res.clearCookie('connect.sid', cookieOptions);
+        
+        console.log('👋 User logged out successfully');
+        res.json({ 
+            success: true, 
+            message: 'Logged out successfully',
+            frontendUrl: FRONTEND_URL
         });
+        
     } catch (error) {
-        console.error('Email status check error:', error);
-        res.status(500).json({ error: 'Failed to check email status' });
+        console.error('Logout error:', error);
+        res.status(500).json({ error: 'Failed to logout' });
     }
 });
 
-// Get Gemini API status
-router.get('/gemini-status', authenticateToken, async (req, res) => {
-    try {
-        const { userRepository } = await import('../repositories/userRepository.js');
-        const user = await userRepository.findById(req.user.user_id);
-        
-        res.json({
-            hasGeminiApiKey: user.has_gemini_api_key,
-            canUseAI: user.has_gemini_api_key
-        });
-    } catch (error) {
-        console.error('Gemini status check error:', error);
-        res.status(500).json({ error: 'Failed to check Gemini status' });
-    }
-});
-
-// Get credentials status (combined)
+// Get credentials status
 router.get('/credentials-status', authenticateToken, async (req, res) => {
     try {
         const { userRepository } = await import('../repositories/userRepository.js');
@@ -348,7 +348,8 @@ router.get('/credentials-status', authenticateToken, async (req, res) => {
             email: user.email,
             canSendEmails: user.has_email_credentials,
             canUseAI: user.has_gemini_api_key,
-            isFullySetup: user.has_email_credentials && user.has_gemini_api_key
+            isFullySetup: user.has_email_credentials && user.has_gemini_api_key,
+            frontendUrl: FRONTEND_URL
         });
     } catch (error) {
         console.error('Credentials status check error:', error);
@@ -396,36 +397,6 @@ router.delete('/gemini-credentials', authenticateToken, async (req, res) => {
     }
 });
 
-// FIXED: Logout with better cookie clearing
-router.post('/logout', authenticateToken, async (req, res) => {
-    try {
-        await authService.logout(req.user.user_id);
-        
-        // FIXED: Clear cookies with same options as when they were set
-        const cookieOptions = {
-            httpOnly: true,
-            secure: false, // Same as when setting for development
-            sameSite: 'none',
-            domain: undefined,
-            path: '/'
-        };
-        
-        res.clearCookie('token', cookieOptions);
-        res.clearCookie('auth_token', cookieOptions);
-        res.clearCookie('connect.sid', cookieOptions);
-        
-        console.log('👋 User logged out successfully');
-        res.json({ 
-            success: true, 
-            message: 'Logged out successfully' 
-        });
-        
-    } catch (error) {
-        console.error('Logout error:', error);
-        res.status(500).json({ error: 'Failed to logout' });
-    }
-});
-
 // Delete account
 router.delete('/account', authenticateToken, async (req, res) => {
     try {
@@ -435,9 +406,8 @@ router.delete('/account', authenticateToken, async (req, res) => {
             // Clear cookies
             const cookieOptions = {
                 httpOnly: true,
-                secure: false,
-                sameSite: 'none',
-                domain: undefined,
+                secure: process.env.NODE_ENV === 'production',
+                sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
                 path: '/'
             };
             
@@ -448,7 +418,8 @@ router.delete('/account', authenticateToken, async (req, res) => {
             console.log('🗑️ Account deleted successfully for user:', req.user.email);
             res.json({ 
                 success: true, 
-                message: 'Account deleted successfully' 
+                message: 'Account deleted successfully',
+                frontendUrl: FRONTEND_URL
             });
         } else {
             res.status(500).json({ 
@@ -464,6 +435,18 @@ router.delete('/account', authenticateToken, async (req, res) => {
             details: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
+});
+
+// Debug endpoint to check environment configuration
+router.get('/debug/config', (req, res) => {
+    res.json({
+        frontendUrl: FRONTEND_URL,
+        nodeEnv: process.env.NODE_ENV,
+        origin: req.headers.origin,
+        referer: req.headers.referer,
+        userAgent: req.headers['user-agent'],
+        timestamp: new Date().toISOString()
+    });
 });
 
 export default router;
