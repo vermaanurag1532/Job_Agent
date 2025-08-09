@@ -196,8 +196,8 @@ export const getCookieOptions = (req) => {
     
     const cookieOptions = {
         httpOnly: true,
-        secure: isSecure,
-        sameSite: isCrossOrigin ? 'none' : 'lax',
+        secure: false,
+        sameSite: 'none',
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
         path: '/'
     };

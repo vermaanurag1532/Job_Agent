@@ -130,10 +130,10 @@ app.use(session({
     rolling: true, // Reset expiration on activity
     cookie: {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production', // 🔥 UPDATED: Dynamic based on environment
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // 🔥 UPDATED: Dynamic
+        secure: false, // 🔥 UPDATED: Dynamic based on environment
+        sameSite: 'none', // 🔥 UPDATED: Dynamic
         maxAge: 7 * 24 * 60 * 60 * 1000,
-        domain: process.env.NODE_ENV === 'production' ? '.jwelease.com' : undefined // 🔥 UPDATED: Dynamic
+        domain: undefined // 🔥 UPDATED: Dynamic
     }
 }));
 

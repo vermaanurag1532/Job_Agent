@@ -302,8 +302,8 @@ router.post('/logout', authenticateToken, async (req, res) => {
         // Clear cookies with same options as when they were set
         const cookieOptions = {
             httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+            secure: false,
+            sameSite: 'none',
             path: '/'
         };
         
@@ -406,8 +406,8 @@ router.delete('/account', authenticateToken, async (req, res) => {
             // Clear cookies
             const cookieOptions = {
                 httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+                secure: false,
+                sameSite: 'none',
                 path: '/'
             };
             
