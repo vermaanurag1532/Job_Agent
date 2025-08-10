@@ -222,7 +222,7 @@ export const getCookieOptions = (req) => {
 };
 
 // Helper function to send token to frontend
-export const sendTokenToFrontend = (res, req, token, redirectPath = '/dashboard') => {
+export const sendTokenToFrontend = (res, req, token, redirectPath = '/') => {
     const cookieOptions = getCookieOptions(req);
     
     // Set the token in multiple ways for maximum compatibility

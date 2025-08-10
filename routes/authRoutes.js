@@ -56,7 +56,7 @@ router.get('/google/callback', (req, res, next) => {
             console.log('🔑 JWT token generated successfully');
             
             // Use the helper function to send token to frontend
-            return sendTokenToFrontend(res, req, token, '/dashboard');
+            return sendTokenToFrontend(res, req, token, '/');
             
         } catch (error) {
             console.error('❌ OAuth callback error:', error);
